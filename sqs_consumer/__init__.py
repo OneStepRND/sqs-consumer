@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
     from mypy_boto3_sqs.type_defs import MessageTypeDef
+    from mypy_boto3_sqs import SQSClient
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +98,51 @@ class Config(BaseSettings):
     health_max_age: int = Field(default=int(timedelta(minutes=2).total_seconds()))
 
 
+def _re_enqueue(
+    *,
+    sqs: "SQSClient",
+    messages: list["MessageTypeDef"],
+    queue_url: str,
+):
+    if not messages:
+        return
+
+    sqs.change_message_visibility_batch(
+        QueueUrl=queue_url,
+        Entries=[
+            {
+                "Id": m["MessageId"],
+                "ReceiptHandle": m["ReceiptHandle"],
+                "VisibilityTimeout": 0,
+            }
+            for m in messages
+            if "MessageId" in m and "ReceiptHandle" in m
+        ],
+    )
+    log.debug(f"re enqueue : {len(messages)}")
+    messages.clear()
+
+
+def _ack(
+    *,
+    sqs: "SQSClient",
+    messages: list["MessageTypeDef"],
+    queue_url: str,
+):
+    sqs.delete_message_batch(
+        QueueUrl=queue_url,
+        Entries=[
+            {
+                "Id": m["MessageId"],
+                "ReceiptHandle": m["ReceiptHandle"],
+            }
+            for m in messages
+            if "MessageId" in m and "ReceiptHandle" in m
+        ],
+    )
+    log.debug(f"ack : {len(messages)}")
+
+
 def consume(
     handler: Callable[["MessageTypeDef"], None],
     config: Config | None = None,
@@ -119,47 +165,10 @@ def consume(
             "config": config.model_dump(mode="json"),
         },
     )
-    messages_to_delete: list["MessageTypeDef"] = []
-    messages: list["MessageTypeDef"] = []
-
-    def re_enqueue():
-        if not messages:
-            return
-
-        sqs.change_message_visibility_batch(
-            QueueUrl=config.queue_url,
-            Entries=[
-                {
-                    "Id": m["MessageId"],
-                    "ReceiptHandle": m["ReceiptHandle"],
-                    "VisibilityTimeout": 0,
-                }
-                for m in messages
-                if "MessageId" in m and "ReceiptHandle" in m
-            ],
-        )
-        log.debug(f"re enqueue : {len(messages)}")
-        messages.clear()
-
-    def ack():
-        if not messages_to_delete:
-            return
-
-        sqs.delete_message_batch(
-            QueueUrl=config.queue_url,
-            Entries=[
-                {
-                    "Id": m["MessageId"],
-                    "ReceiptHandle": m["ReceiptHandle"],
-                }
-                for m in messages_to_delete
-                if "MessageId" in m and "ReceiptHandle" in m
-            ],
-        )
-        log.debug(f"ack : {len(messages_to_delete)}")
-        messages_to_delete.clear()
-
+    to_delete: list["MessageTypeDef"] = []
+    to_process: list["MessageTypeDef"] = []
     total_messages_processed = 0
+
     while not shutdown.shutdown_requested:
         log.debug(f"calling receive_message from {config.queue_url}")
         health.heartbeat()
@@ -169,14 +178,15 @@ def consume(
             MaxNumberOfMessages=config.max_messages,
             VisibilityTimeout=config.visibility_timeout,
         )
-        messages = response.get("Messages", [])
-        while messages:
-            m = messages.pop(0)
+        to_process = response.get("Messages", [])
+
+        while to_process:
+            m = to_process.pop(0)
             health.heartbeat()
             if shutdown.shutdown_requested:
-                messages.append(m)
+                to_process.append(m)
                 log.debug(
-                    f"shutdown signal stopping processing : {len(messages)} messages pending in memory"
+                    f"shutdown signal stopping processing : {len(to_process)} messages pending in memory"
                 )
                 break
 
@@ -199,15 +209,15 @@ def consume(
                         "total_messages_processed": total_messages_processed,
                     },
                 )
-                messages_to_delete.append(m)
+                to_delete.append(m)
                 health.heartbeat()
                 if total_messages_processed == 1:
                     health.mark_ready()
 
-        ack()
+        _ack(sqs=sqs, queue_url=config.queue_url, messages=to_delete)
 
-    ack()
-    re_enqueue()
+    _ack(sqs=sqs, queue_url=config.queue_url, messages=to_delete)
+    _re_enqueue(sqs=sqs, queue_url=config.queue_url, messages=to_process)
     sqs.close()
 
 
