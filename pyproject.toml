@@ -28,5 +28,6 @@ dev = [
     "moto[sqs]>=5.1.8",
     "pyright>=1.1.403",
     "pytest>=8.4.1",
+    "pytest-cov>=6.2.1",
     "ruff>=0.12.5",
 ]
