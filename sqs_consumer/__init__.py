@@ -1,59 +1,41 @@
+import dataclasses
 import logging
 import signal
+import threading
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 import boto3
+import flask
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from werkzeug.serving import make_server
 
 if TYPE_CHECKING:
+    from mypy_boto3_sqs import SQSClient
     from mypy_boto3_sqs.type_defs import MessageTypeDef
 
 log = logging.getLogger(__name__)
 
 
-class SimpleHealthCheck:
-    def __init__(self, health_dir: str):
-        self.health_dir = Path(health_dir)
-        self.health_dir.mkdir(parents=True, exist_ok=True)
-        self.heartbeat_file = self.health_dir / "heartbeat"
-        self.ready_file = self.health_dir / "ready"
-        self.heartbeat()
+@dataclasses.dataclass(kw_only=True)
+class Health:
+    ready: bool = dataclasses.field(default=False)
+    last_heartbeat: datetime | None = dataclasses.field(default=None)
+    heartbeat_max_age: timedelta = dataclasses.field(default=timedelta(minutes=3))
 
-    @staticmethod
-    def iso_now():
-        return datetime.now(timezone.utc).isoformat()
+    @property
+    def healthy(self):
+        if self.last_heartbeat is None:
+            return False
+
+        return (
+            datetime.now(timezone.utc) - self.last_heartbeat
+        ) < self.heartbeat_max_age
 
     def heartbeat(self):
-        timestamp = self.iso_now()
-        temp_file = self.heartbeat_file.with_suffix(".tmp")
-        temp_file.write_text(timestamp)
-        temp_file.replace(self.heartbeat_file)
-        log.debug("heartbeat")
-
-    def mark_ready(self):
-        self.ready_file.write_text(self.iso_now())
-        log.info("marked ready")
-
-    def is_healthy(
-        self,
-        max_age: timedelta = timedelta(minutes=1),
-    ) -> tuple[bool, str]:
-        if not self.heartbeat_file.exists():
-            return False, "No heartbeat file"
-        now = datetime.now(timezone.utc)
-        last = datetime.fromisoformat(self.heartbeat_file.read_text())
-        age = now - last
-        if age > max_age:
-            return False, f"Heartbeat too old: {age}s"
-
-        return True, "Healthy"
-
-    def is_ready(self):
-        return self.ready_file.exists()
+        self.last_heartbeat = datetime.now(timezone.utc)
 
 
 class GracefulShutdown:
@@ -94,18 +76,94 @@ class Config(BaseSettings):
         ge=0,
         description="Message visibility timeout",
     )
-    health_dir: str = Field(default="/tmp/sqs-consumer/health")
+    health_check_port: int = Field(default=8080)
+    health_max_age: int = Field(default=int(timedelta(minutes=3).total_seconds()))
+
+
+def create_health_app(health: Health):
+    app = flask.Flask(__name__)
+
+    @app.get("/health")
+    def check_health():  # pyright: ignore[reportUnusedFunction]
+        if health.healthy:
+            return {"ok": True}, 200
+
+        return {"ok": False}, 400
+
+    @app.get("/ready")
+    def check_ready():  # pyright: ignore[reportUnusedFunction]
+        if health.ready:
+            return {"ok": True}, 200
+
+        return {"ok": False}, 400
+
+    return app
+
+
+def _re_enqueue(
+    *,
+    sqs: "SQSClient",
+    messages: list["MessageTypeDef"],
+    queue_url: str,
+):
+    if not messages:
+        return
+
+    sqs.change_message_visibility_batch(
+        QueueUrl=queue_url,
+        Entries=[
+            {
+                "Id": m["MessageId"],
+                "ReceiptHandle": m["ReceiptHandle"],
+                "VisibilityTimeout": 0,
+            }
+            for m in messages
+            if "MessageId" in m and "ReceiptHandle" in m
+        ],
+    )
+    log.debug(f"re enqueue : {len(messages)}")
+    messages.clear()
+
+
+def _ack(
+    *,
+    sqs: "SQSClient",
+    messages: list["MessageTypeDef"],
+    queue_url: str,
+):
+    sqs.delete_message_batch(
+        QueueUrl=queue_url,
+        Entries=[
+            {
+                "Id": m["MessageId"],
+                "ReceiptHandle": m["ReceiptHandle"],
+            }
+            for m in messages
+            if "MessageId" in m and "ReceiptHandle" in m
+        ],
+    )
+    log.debug(f"ack : {len(messages)}")
 
 
 def consume(
     handler: Callable[["MessageTypeDef"], None],
     config: Config | None = None,
-    health: SimpleHealthCheck | None = None,
+    health: Health | None = None,
     shutdown: GracefulShutdown | None = None,
 ):
     config = config or Config()  # type: ignore
-    health = health or SimpleHealthCheck(config.health_dir)
+    health = health or Health(
+        heartbeat_max_age=timedelta(seconds=config.health_max_age)
+    )
     shutdown = shutdown or GracefulShutdown()
+
+    health_app = create_health_app(health)
+    health_server = make_server("0.0.0.0", config.health_check_port, health_app)
+    server_thread = threading.Thread(
+        target=health_server.serve_forever,
+        daemon=True,
+    )
+    server_thread.start()
 
     sqs = (
         boto3.client("sqs", endpoint_url=config.endpoint_url)  # type: ignore
@@ -119,47 +177,10 @@ def consume(
             "config": config.model_dump(mode="json"),
         },
     )
-    messages_to_delete: list["MessageTypeDef"] = []
-    messages: list["MessageTypeDef"] = []
-
-    def re_enqueue():
-        if not messages:
-            return
-
-        sqs.change_message_visibility_batch(
-            QueueUrl=config.queue_url,
-            Entries=[
-                {
-                    "Id": m["MessageId"],
-                    "ReceiptHandle": m["ReceiptHandle"],
-                    "VisibilityTimeout": 0,
-                }
-                for m in messages
-                if "MessageId" in m and "ReceiptHandle" in m
-            ],
-        )
-        log.debug(f"re enqueue : {len(messages)}")
-        messages.clear()
-
-    def ack():
-        if not messages_to_delete:
-            return
-
-        sqs.delete_message_batch(
-            QueueUrl=config.queue_url,
-            Entries=[
-                {
-                    "Id": m["MessageId"],
-                    "ReceiptHandle": m["ReceiptHandle"],
-                }
-                for m in messages_to_delete
-                if "MessageId" in m and "ReceiptHandle" in m
-            ],
-        )
-        log.debug(f"ack : {len(messages_to_delete)}")
-        messages_to_delete.clear()
-
+    to_delete: list["MessageTypeDef"] = []
+    to_process: list["MessageTypeDef"] = []
     total_messages_processed = 0
+
     while not shutdown.shutdown_requested:
         log.debug(f"calling receive_message from {config.queue_url}")
         health.heartbeat()
@@ -169,19 +190,15 @@ def consume(
             MaxNumberOfMessages=config.max_messages,
             VisibilityTimeout=config.visibility_timeout,
         )
-        if "Messages" not in response:
-            continue
-        messages = response["Messages"]
-        if not messages:
-            continue
-        messages.reverse()
-        while messages:
-            m = messages.pop()
+        to_process = response.get("Messages", [])
+
+        while to_process:
+            m = to_process.pop(0)
             health.heartbeat()
             if shutdown.shutdown_requested:
-                messages.append(m)
+                to_process.append(m)
                 log.debug(
-                    f"shutdown signal stopping processing : {len(messages)} messages pending in memory"
+                    f"shutdown signal stopping processing : {len(to_process)} messages pending in memory"
                 )
                 break
 
@@ -204,13 +221,14 @@ def consume(
                         "total_messages_processed": total_messages_processed,
                     },
                 )
-                messages_to_delete.append(m)
+                to_delete.append(m)
                 health.heartbeat()
                 if total_messages_processed == 1:
-                    health.mark_ready()
+                    health.ready = True
 
-        ack()
+        _ack(sqs=sqs, queue_url=config.queue_url, messages=to_delete)
 
-    ack()
-    re_enqueue()
+    _ack(sqs=sqs, queue_url=config.queue_url, messages=to_delete)
+    _re_enqueue(sqs=sqs, queue_url=config.queue_url, messages=to_process)
     sqs.close()
+    health_server.shutdown()

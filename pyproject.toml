@@ -14,9 +14,15 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "boto3>=1.39.12",
+    "flask>=3.1.1",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.10.1",
 ]
+
+[project.scripts]
+check-ready="sqs_consumer:check_ready"
+check-health="sqs_consumer:check_health"
+
 
 [tool.pyright]
 typeCheckingMode = "strict"
@@ -28,5 +34,6 @@ dev = [
     "moto[sqs]>=5.1.8",
     "pyright>=1.1.403",
     "pytest>=8.4.1",
+    "pytest-cov>=6.2.1",
     "ruff>=0.12.5",
 ]
