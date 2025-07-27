@@ -169,7 +169,7 @@ def consume(
             MaxNumberOfMessages=config.max_messages,
             VisibilityTimeout=config.visibility_timeout,
         )
-        messages = response.get("messages", [])
+        messages = response.get("Messages", [])
         while messages:
             m = messages.pop(0)
             health.heartbeat()
