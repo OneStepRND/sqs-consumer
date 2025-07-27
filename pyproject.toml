@@ -18,6 +18,11 @@ dependencies = [
     "pydantic-settings>=2.10.1",
 ]
 
+[project.scripts]
+check-ready="sqs_consumer:check_ready"
+check-health="sqs_consumer:check_health"
+
+
 [tool.pyright]
 typeCheckingMode = "strict"
 

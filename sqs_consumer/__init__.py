@@ -21,7 +21,6 @@ class SimpleHealthCheck:
         self.health_dir.mkdir(parents=True, exist_ok=True)
         self.heartbeat_file = self.health_dir / "heartbeat"
         self.ready_file = self.health_dir / "ready"
-        self.heartbeat()
 
     @staticmethod
     def iso_now():
@@ -95,6 +94,7 @@ class Config(BaseSettings):
         description="Message visibility timeout",
     )
     health_dir: str = Field(default="/tmp/sqs-consumer/health")
+    health_max_age: int = Field(default=int(timedelta(minutes=2).total_seconds()))
 
 
 def consume(
@@ -209,3 +209,19 @@ def consume(
     ack()
     re_enqueue()
     sqs.close()
+
+
+def check_ready(config: Config | None = None, health: SimpleHealthCheck | None = None):
+    config = config or Config()  # type: ignore
+    health = health or SimpleHealthCheck(config.health_dir)
+    return 0 if health.is_ready() else 1
+
+
+def check_health(config: Config | None = None, health: SimpleHealthCheck | None = None):
+    config = config or Config()  # type: ignore
+    health = health or SimpleHealthCheck(config.health_dir)
+    healthy, message = health.is_healthy(
+        max_age=timedelta(seconds=config.health_max_age)
+    )
+    print(message)
+    return 0 if healthy else 1
