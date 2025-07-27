@@ -1,3 +1,4 @@
+from datetime import timedelta
 import os
 import threading
 import time
@@ -8,7 +9,7 @@ import pytest
 from moto import mock_aws
 from mypy_boto3_sqs import SQSClient
 from mypy_boto3_sqs.type_defs import MessageTypeDef
-
+import freezegun
 from sqs_consumer import Config, GracefulShutdown, SimpleHealthCheck, consume
 
 
@@ -100,3 +101,22 @@ def test_consume(sqs: "SQSClient", config: Config, health: SimpleHealthCheck):
     assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
     with pytest.raises(KeyError):
         response["Messages"]
+
+
+def test_health_check(health: SimpleHealthCheck):
+    assert health.is_ready() is False
+    assert health.is_healthy()[0] is False
+    health.mark_ready()
+    assert health.is_ready() is True
+    health.heartbeat()
+    assert health.is_healthy()[0] is True
+    with freezegun.freeze_time(timedelta(minutes=1)):
+        assert health.is_healthy()[0] is True
+
+    with freezegun.freeze_time(timedelta(minutes=3)):
+        assert health.is_healthy()[0] is False
+
+    health.heartbeat_file.unlink()
+    assert health.is_healthy()[0] is False
+    health.ready_file.unlink()
+    assert health.is_ready() is False

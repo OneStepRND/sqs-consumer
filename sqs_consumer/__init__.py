@@ -39,7 +39,7 @@ class SimpleHealthCheck:
 
     def is_healthy(
         self,
-        max_age: timedelta = timedelta(minutes=1),
+        max_age: timedelta = timedelta(minutes=2),
     ) -> tuple[bool, str]:
         if not self.heartbeat_file.exists():
             return False, "No heartbeat file"
