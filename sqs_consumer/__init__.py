@@ -169,14 +169,9 @@ def consume(
             MaxNumberOfMessages=config.max_messages,
             VisibilityTimeout=config.visibility_timeout,
         )
-        if "Messages" not in response:
-            continue
-        messages = response["Messages"]
-        if not messages:
-            continue
-        messages.reverse()
+        messages = response.get("messages", [])
         while messages:
-            m = messages.pop()
+            m = messages.pop(0)
             health.heartbeat()
             if shutdown.shutdown_requested:
                 messages.append(m)
