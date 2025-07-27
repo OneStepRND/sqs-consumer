@@ -4,4 +4,4 @@ uv sync --dev
 uv run ruff check
 uv run ruff format --check
 uv run pyright
-uv run pytest --cov=sqs_consumer --cov-report=html --cov-report=term
+uv run pytest --cov=sqs_consumer --cov-report=term
