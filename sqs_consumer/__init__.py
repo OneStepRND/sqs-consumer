@@ -1,59 +1,41 @@
+import dataclasses
 import logging
 import signal
+import threading
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 import boto3
+import flask
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from werkzeug.serving import make_server
 
 if TYPE_CHECKING:
-    from mypy_boto3_sqs.type_defs import MessageTypeDef
     from mypy_boto3_sqs import SQSClient
+    from mypy_boto3_sqs.type_defs import MessageTypeDef
 
 log = logging.getLogger(__name__)
 
 
-class SimpleHealthCheck:
-    def __init__(self, health_dir: str):
-        self.health_dir = Path(health_dir)
-        self.health_dir.mkdir(parents=True, exist_ok=True)
-        self.heartbeat_file = self.health_dir / "heartbeat"
-        self.ready_file = self.health_dir / "ready"
+@dataclasses.dataclass(kw_only=True)
+class Health:
+    ready: bool = dataclasses.field(default=False)
+    last_heartbeat: datetime | None = dataclasses.field(default=None)
+    heartbeat_max_age: timedelta = dataclasses.field(default=timedelta(minutes=3))
 
-    @staticmethod
-    def iso_now():
-        return datetime.now(timezone.utc).isoformat()
+    @property
+    def healthy(self):
+        if self.last_heartbeat is None:
+            return False
+
+        return (
+            datetime.now(timezone.utc) - self.last_heartbeat
+        ) < self.heartbeat_max_age
 
     def heartbeat(self):
-        timestamp = self.iso_now()
-        temp_file = self.heartbeat_file.with_suffix(".tmp")
-        temp_file.write_text(timestamp)
-        temp_file.replace(self.heartbeat_file)
-        log.debug("heartbeat")
-
-    def mark_ready(self):
-        self.ready_file.write_text(self.iso_now())
-        log.info("marked ready")
-
-    def is_healthy(
-        self,
-        max_age: timedelta = timedelta(minutes=2),
-    ) -> tuple[bool, str]:
-        if not self.heartbeat_file.exists():
-            return False, "No heartbeat file"
-        now = datetime.now(timezone.utc)
-        last = datetime.fromisoformat(self.heartbeat_file.read_text())
-        age = now - last
-        if age > max_age:
-            return False, f"Heartbeat too old: {age}s"
-
-        return True, "Healthy"
-
-    def is_ready(self):
-        return self.ready_file.exists()
+        self.last_heartbeat = datetime.now(timezone.utc)
 
 
 class GracefulShutdown:
@@ -94,8 +76,28 @@ class Config(BaseSettings):
         ge=0,
         description="Message visibility timeout",
     )
-    health_dir: str = Field(default="/tmp/sqs-consumer/health")
-    health_max_age: int = Field(default=int(timedelta(minutes=2).total_seconds()))
+    health_check_port: int = Field(default=8080)
+    health_max_age: int = Field(default=int(timedelta(minutes=3).total_seconds()))
+
+
+def create_health_app(health: Health):
+    app = flask.Flask(__name__)
+
+    @app.get("/health")
+    def check_health():  # pyright: ignore[reportUnusedFunction]
+        if health.healthy:
+            return {"ok": True}, 200
+
+        return {"ok": False}, 400
+
+    @app.get("/ready")
+    def check_ready():  # pyright: ignore[reportUnusedFunction]
+        if health.ready:
+            return {"ok": True}, 200
+
+        return {"ok": False}, 400
+
+    return app
 
 
 def _re_enqueue(
@@ -146,12 +148,22 @@ def _ack(
 def consume(
     handler: Callable[["MessageTypeDef"], None],
     config: Config | None = None,
-    health: SimpleHealthCheck | None = None,
+    health: Health | None = None,
     shutdown: GracefulShutdown | None = None,
 ):
     config = config or Config()  # type: ignore
-    health = health or SimpleHealthCheck(config.health_dir)
+    health = health or Health(
+        heartbeat_max_age=timedelta(seconds=config.health_max_age)
+    )
     shutdown = shutdown or GracefulShutdown()
+
+    health_app = create_health_app(health)
+    health_server = make_server("0.0.0.0", config.health_check_port, health_app)
+    server_thread = threading.Thread(
+        target=health_server.serve_forever,
+        daemon=True,
+    )
+    server_thread.start()
 
     sqs = (
         boto3.client("sqs", endpoint_url=config.endpoint_url)  # type: ignore
@@ -212,26 +224,11 @@ def consume(
                 to_delete.append(m)
                 health.heartbeat()
                 if total_messages_processed == 1:
-                    health.mark_ready()
+                    health.ready = True
 
         _ack(sqs=sqs, queue_url=config.queue_url, messages=to_delete)
 
     _ack(sqs=sqs, queue_url=config.queue_url, messages=to_delete)
     _re_enqueue(sqs=sqs, queue_url=config.queue_url, messages=to_process)
     sqs.close()
-
-
-def check_ready(config: Config | None = None, health: SimpleHealthCheck | None = None):
-    config = config or Config()  # type: ignore
-    health = health or SimpleHealthCheck(config.health_dir)
-    return 0 if health.is_ready() else 1
-
-
-def check_health(config: Config | None = None, health: SimpleHealthCheck | None = None):
-    config = config or Config()  # type: ignore
-    health = health or SimpleHealthCheck(config.health_dir)
-    healthy, message = health.is_healthy(
-        max_age=timedelta(seconds=config.health_max_age)
-    )
-    print(message)
-    return 0 if healthy else 1
+    health_server.shutdown()

@@ -2,7 +2,6 @@ from datetime import timedelta
 import os
 import threading
 import time
-from pathlib import Path
 
 import boto3
 import pytest
@@ -10,7 +9,7 @@ from moto import mock_aws
 from mypy_boto3_sqs import SQSClient
 from mypy_boto3_sqs.type_defs import MessageTypeDef
 import freezegun
-from sqs_consumer import Config, GracefulShutdown, SimpleHealthCheck, consume
+from sqs_consumer import Config, GracefulShutdown, Health, consume, create_health_app
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -28,22 +27,14 @@ def aws_envvars():
 
 
 @pytest.fixture()
-def health_dir(tmp_path: Path):
-    health_path = tmp_path / "health"
-    health_path.mkdir(parents=True, exist_ok=True)
-    return health_path.absolute().as_posix()
+def health():
+    return Health()
 
 
 @pytest.fixture()
-def health(health_dir: str):
-    return SimpleHealthCheck(health_dir)
-
-
-@pytest.fixture()
-def config(queue_url: str, health_dir: str):
+def config(queue_url: str):
     return Config(
         queue_url=queue_url,
-        health_dir=health_dir,
         wait_time_seconds=0,
     )
 
@@ -61,7 +52,7 @@ def queue_url(sqs: "SQSClient"):
     return response["QueueUrl"]
 
 
-def test_consume(sqs: "SQSClient", config: Config, health: SimpleHealthCheck):
+def test_consume(sqs: "SQSClient", config: Config, health: Health):
     processed_messages: list[str] = []
     test_messages = [
         sqs.send_message(
@@ -88,12 +79,11 @@ def test_consume(sqs: "SQSClient", config: Config, health: SimpleHealthCheck):
     consumer_thread.start()
     timeout = time.time() + 5
 
-    while not health.is_ready() and time.time() < timeout:
+    while not health.ready and time.time() < timeout:
         time.sleep(0.1)
 
-    assert health.is_ready()
-    ok, msg = health.is_healthy()
-    assert ok, msg
+    assert health.ready
+    assert health.healthy
     shutdown.shutdown_requested = True
     consumer_thread.join(timeout=10)
     assert len(test_messages) == len(processed_messages)
@@ -103,20 +93,35 @@ def test_consume(sqs: "SQSClient", config: Config, health: SimpleHealthCheck):
         response["Messages"]
 
 
-def test_health_check(health: SimpleHealthCheck):
-    assert health.is_ready() is False
-    assert health.is_healthy()[0] is False
-    health.mark_ready()
-    assert health.is_ready() is True
+def test_health_check(health: Health):
+    assert health.healthy is False
     health.heartbeat()
-    assert health.is_healthy()[0] is True
+    assert health.healthy is True
     with freezegun.freeze_time(timedelta(minutes=1)):
-        assert health.is_healthy()[0] is True
+        assert health.healthy is True
 
     with freezegun.freeze_time(timedelta(minutes=3)):
-        assert health.is_healthy()[0] is False
+        assert health.healthy is False
 
-    health.heartbeat_file.unlink()
-    assert health.is_healthy()[0] is False
-    health.ready_file.unlink()
-    assert health.is_ready() is False
+
+def test_health_app(health: Health):
+    app = create_health_app(health)
+    client = app.test_client()
+
+    resp = client.get("/ready")
+    assert resp.status_code == 400
+    health.ready = True
+
+    resp = client.get("/ready")
+    assert resp.status_code == 200
+
+    resp = client.get("/health")
+    assert resp.status_code == 400
+    health.heartbeat()
+
+    resp = client.get("/health")
+    assert resp.status_code == 200
+
+    with freezegun.freeze_time(timedelta(minutes=60)):
+        resp = client.get("/health")
+        assert resp.status_code == 400
