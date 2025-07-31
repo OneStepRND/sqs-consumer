@@ -137,9 +137,9 @@ def test_health_server(health: Health, config: Config):
     http = urllib3.PoolManager()
     base_url = f"http://127.0.0.1:{config.health_check_port}"
 
-    # Test ready endpoint - should return 400 when not ready
+    # Test ready endpoint - should return 503 when not ready
     resp = http.request("GET", f"{base_url}/ready")
-    assert resp.status == 400
+    assert resp.status == 503
     assert json.loads(resp.data) == {"ok": False}
 
     # Make ready
@@ -150,9 +150,9 @@ def test_health_server(health: Health, config: Config):
     assert resp.status == 200
     assert json.loads(resp.data) == {"ok": True}
 
-    # Test health endpoint - should return 400 when not healthy
+    # Test health endpoint - should return 503 when not healthy
     resp = http.request("GET", f"{base_url}/health")
-    assert resp.status == 400
+    assert resp.status == 503
     assert json.loads(resp.data) == {"ok": False}
 
     # Make healthy
