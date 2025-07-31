@@ -1,25 +1,24 @@
-from datetime import timedelta
-import json
 import os
+import socket
 import threading
 import time
+from datetime import timedelta
 
 import boto3
+import freezegun
 import pytest
+import urllib3
 from moto import mock_aws
 from mypy_boto3_sqs import SQSClient
 
-import freezegun
-import urllib3
 from sqs_consumer import (
     Config,
     GracefulShutdown,
     Health,
-    consume,
     Message,
+    consume,
     create_health_server,
 )
-import socket
 
 
 def get_free_port():
@@ -96,12 +95,8 @@ def test_consume(sqs: "SQSClient", config: Config, health: Health):
         },
     )
     consumer_thread.start()
-    timeout = time.time() + 5
 
-    while not health.ready and time.time() < timeout:
-        time.sleep(0.1)
-
-    assert health.ready
+    time.sleep(0.1)
     assert health.healthy
     shutdown.shutdown_requested.set()
     consumer_thread.join(timeout=10)
@@ -137,23 +132,9 @@ def test_health_server(health: Health, config: Config):
     http = urllib3.PoolManager()
     base_url = f"http://127.0.0.1:{config.health_check_port}"
 
-    # Test ready endpoint - should return 503 when not ready
-    resp = http.request("GET", f"{base_url}/ready")
-    assert resp.status == 503
-    assert json.loads(resp.data) == {"ok": False}
-
-    # Make ready
-    health.ready = True
-
-    # Test ready endpoint - should return 200 when ready
-    resp = http.request("GET", f"{base_url}/ready")
-    assert resp.status == 200
-    assert json.loads(resp.data) == {"ok": True}
-
     # Test health endpoint - should return 503 when not healthy
     resp = http.request("GET", f"{base_url}/health")
     assert resp.status == 503
-    assert json.loads(resp.data) == {"ok": False}
 
     # Make healthy
     health.heartbeat()
@@ -161,7 +142,6 @@ def test_health_server(health: Health, config: Config):
     # Test health endpoint - should return 200 when healthy
     resp = http.request("GET", f"{base_url}/health")
     assert resp.status == 200
-    assert json.loads(resp.data) == {"ok": True}
 
     # Test non-existent endpoint
     resp = http.request("GET", f"{base_url}/nonexistent")

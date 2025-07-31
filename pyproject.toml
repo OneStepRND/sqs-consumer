@@ -8,7 +8,7 @@ module-root = ""
 
 [project]
 name = "sqs-consumer"
-version = "0.2.0"
+version = "0.3.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -17,11 +17,6 @@ dependencies = [
     "pydantic>=2.11.7",
     "pydantic-settings>=2.10.1",
 ]
-
-[project.scripts]
-check-ready="sqs_consumer:check_ready"
-check-health="sqs_consumer:check_health"
-
 
 [tool.pyright]
 typeCheckingMode = "strict"

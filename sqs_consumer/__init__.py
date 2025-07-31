@@ -1,5 +1,4 @@
 import dataclasses
-import json
 import logging
 import random
 import signal
@@ -28,7 +27,6 @@ MessageQueue = Queue[Message]
 
 @dataclasses.dataclass(kw_only=True)
 class Health:
-    ready: bool = dataclasses.field(default=False)
     last_heartbeat: datetime | None = dataclasses.field(default=None)
     heartbeat_max_age: timedelta = dataclasses.field(default=timedelta(minutes=3))
 
@@ -103,18 +101,13 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             ok = self.health.healthy
-        elif self.path == "/ready":
-            ok = self.health.ready
         else:
             self.send_error(404)
             return
         status_code = 200 if ok else 503
         self.send_response(status_code)
-        response_body = json.dumps({"ok": ok}).encode("utf-8")
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(response_body)))
+        self.send_header("Content-Length", "0")
         self.end_headers()
-        self.wfile.write(response_body)
 
 
 def create_health_server(health: Health, host: str, port: int) -> HTTPServer:
@@ -204,32 +197,25 @@ def consume(
         except Empty:
             continue
 
-        try:
-            log.debug(f"calling : {handler} with : {m.id}")
-            start = time.time()
-            handler(m)
-            total_messages_processed += 1
-            runtime = time.time() - start
-            log.info(
-                f"runtime for {handler} with {m.id} : {runtime:.2f}",
-                extra={
-                    "runtime": runtime,
-                    "message_id": m.id,
-                    "total_messages_processed": total_messages_processed,
-                },
-            )
-            sqs.delete_message(
-                QueueUrl=config.queue_url,
-                ReceiptHandle=m.receipt,
-            )
-            health.heartbeat()
-            if total_messages_processed == 1:
-                health.ready = True
-        except Exception as e:
-            log.exception(f"failed to process {e}")
-        finally:
-            queue_to_process.task_done()
-            health.heartbeat()
+        log.debug(f"calling : {handler} with : {m.id}")
+        start = time.time()
+        handler(m)
+        total_messages_processed += 1
+        runtime = time.time() - start
+        log.info(
+            f"runtime for {handler} with {m.id} : {runtime:.2f}",
+            extra={
+                "runtime": runtime,
+                "message_id": m.id,
+                "total_messages_processed": total_messages_processed,
+            },
+        )
+        sqs.delete_message(
+            QueueUrl=config.queue_url,
+            ReceiptHandle=m.receipt,
+        )
+        queue_to_process.task_done()
+        health.heartbeat()
 
     log.info("starting queue shutdown set messages VisibilityTimeout back to 0")
     while not queue_to_process.empty():
