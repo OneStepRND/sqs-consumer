@@ -8,13 +8,12 @@ module-root = ""
 
 [project]
 name = "sqs-consumer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "boto3>=1.39.12",
-    "flask>=3.1.1",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.10.1",
 ]
@@ -36,4 +35,5 @@ dev = [
     "pytest>=8.4.1",
     "pytest-cov>=6.2.1",
     "ruff>=0.12.5",
+    "urllib3>=2.5.0",
 ]
