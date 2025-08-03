@@ -3,6 +3,7 @@ import socket
 import threading
 import time
 from datetime import timedelta
+from typing import Any
 
 import boto3
 import freezegun
@@ -45,6 +46,12 @@ def aws_envvars():
 
 
 @pytest.fixture()
+def sqs():
+    with mock_aws():
+        yield boto3.client("sqs")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.fixture()
 def health():
     return Health()
 
@@ -56,13 +63,6 @@ def config(queue_url: str):
         wait_time_seconds=0,
         health_check_port=get_free_port(),
     )
-
-
-@pytest.fixture()
-def sqs(aws_envvars: dict[str, str]):
-    with mock_aws():
-        client: "SQSClient" = boto3.client("sqs")  # type: ignore
-        yield client
 
 
 @pytest.fixture
@@ -92,13 +92,16 @@ def test_consume(sqs: "SQSClient", config: Config, health: Health):
             "config": config,
             "shutdown": shutdown,
             "health": health,
+            "sqs": sqs,
         },
     )
     consumer_thread.start()
+    timeout = time.time() + 5
+    while len(processed_messages) < len(test_messages) and time.time() <= timeout:
+        time.sleep(0.1)
 
-    time.sleep(0.1)
     assert health.healthy
-    shutdown.shutdown_requested.set()
+    shutdown.shutdown()
     consumer_thread.join(timeout=10)
     assert len(test_messages) == len(processed_messages)
     response = sqs.receive_message(QueueUrl=config.queue_url, WaitTimeSeconds=0)

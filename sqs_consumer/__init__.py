@@ -1,17 +1,22 @@
 import dataclasses
+import itertools
 import logging
 import random
 import signal
 import threading
 import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from queue import Empty, Queue
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import boto3
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from mypy_boto3_sqs.client import SQSClient
 
 log = logging.getLogger(__name__)
 
@@ -47,13 +52,25 @@ class GracefulShutdown:
     """Simple graceful shutdown handler."""
 
     def __init__(self):
-        self.shutdown_requested = threading.Event()
-        signal.signal(signal.SIGTERM, self._signal_handler)
-        signal.signal(signal.SIGINT, self._signal_handler)
+        self.shutdown_requested = False
 
     def _signal_handler(self, signum: int, frame: Any):
-        log.info(f"Received signal {signum}, initiating graceful shutdown...")
-        self.shutdown_requested.set()
+        self.shutdown()
+
+    def shutdown(self):
+        self.shutdown_requested = True
+
+    @classmethod
+    def with_signal(cls):
+        instance = cls()
+
+        def handler(signum: int, frame: Any):
+            instance.shutdown()
+
+        signal.signal(signal.SIGTERM, handler)
+        signal.signal(signal.SIGINT, handler)
+
+        return instance
 
 
 class Config(BaseSettings):
@@ -83,7 +100,8 @@ class Config(BaseSettings):
     )
     health_check_port: int = Field(default=8080)
     health_max_age: int = Field(default=int(timedelta(minutes=3).total_seconds()))
-    fetch_max_sleep: int = Field(default=int(timedelta(seconds=2).total_seconds()))
+    fetch_min_sleep: int = Field(default=int(timedelta(seconds=1).total_seconds()))
+    fetch_max_sleep: int = Field(default=int(timedelta(seconds=3).total_seconds()))
     fetch_min_messages: int = Field(default=5)
 
 
@@ -99,14 +117,10 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         log.debug(f"Health check: {format % args}")
 
     def do_GET(self):
-        if self.path == "/health":
-            ok = self.health.healthy
-        else:
+        if self.path != "/health":
             self.send_error(404)
             return
-        status_code = 200 if ok else 503
-        self.send_response(status_code)
-        self.send_header("Content-Length", "0")
+        self.send_response(200 if self.health.healthy else 503)
         self.end_headers()
 
 
@@ -121,45 +135,76 @@ def create_health_server(health: Health, host: str, port: int) -> HTTPServer:
     return server
 
 
-def _fetch_sqs(
+def _fetch_sqs_thread(
+    sqs: "SQSClient",
     shutdown: GracefulShutdown,
     config: Config,
     queue: MessageQueue,
 ):
-    sqs = boto3.client("sqs", endpoint_url=config.endpoint_url)  # pyright: ignore[reportUnknownMemberType]
-    while not shutdown.shutdown_requested.is_set():
-        qsize = queue.qsize()
-        if qsize > config.fetch_min_messages:
-            sleep = random.random() * config.fetch_max_sleep
-            log.debug(f"{qsize=} sleep for {sleep:.2f}")
-            time.sleep(sleep)
-            continue
+    def run():
+        while not shutdown.shutdown_requested:
+            qsize = queue.qsize()
+            if qsize > config.fetch_min_messages:
+                sleep = random.uniform(config.fetch_min_sleep, config.fetch_max_sleep)
+                log.debug(f"{qsize=} sleep for {sleep:.2f}")
+                time.sleep(sleep)
+                continue
 
-        log.debug("fetching message from sqs")
-        response = sqs.receive_message(
-            QueueUrl=config.queue_url,
-            WaitTimeSeconds=config.wait_time_seconds,
-            MaxNumberOfMessages=config.max_messages,
-            VisibilityTimeout=config.visibility_timeout,
+            log.debug("fetching message from sqs")
+
+            response = sqs.receive_message(
+                QueueUrl=config.queue_url,
+                WaitTimeSeconds=config.wait_time_seconds,
+                MaxNumberOfMessages=config.max_messages,
+                VisibilityTimeout=config.visibility_timeout,
+            )
+            messages = response.get("Messages", [])
+            log.debug(f"got {len(messages)} from queue")
+            for m in response.get("Messages", []):
+                queue.put_nowait(Message.model_validate(m))
+
+        sqs.close()
+
+    return run
+
+
+def _get_all[T](queue: Queue[T]) -> Iterable[T]:
+    while True:
+        try:
+            yield queue.get_nowait()
+        except Empty:
+            break
+
+
+def _requeue(sqs: "SQSClient", msgs: Iterable[Message], queue_url: str):
+    for batch in itertools.batched(msgs, 10):
+        sqs.change_message_visibility_batch(
+            QueueUrl=queue_url,
+            Entries=[
+                {
+                    "ReceiptHandle": m.receipt,
+                    "VisibilityTimeout": 0,
+                    "Id": m.id,
+                }
+                for m in batch
+            ],
         )
-        messages = response.get("Messages", [])
-        log.debug(f"got {len(messages)} from queue")
-        for m in response.get("Messages", []):
-            queue.put_nowait(Message.model_validate(m))
 
 
 def consume(
+    *,
     handler: Callable[[Message], None],
     config: Config | None = None,
     health: Health | None = None,
-    shutdown: GracefulShutdown | None = None,
+    shutdown: GracefulShutdown,
+    sqs: "SQSClient | None" = None,
 ):
     config = config or Config()  # type: ignore
     health = health or Health(
         heartbeat_max_age=timedelta(seconds=config.health_max_age)
     )
     queue_to_process: MessageQueue = Queue(config.max_messages * 3)
-    shutdown = shutdown or GracefulShutdown()
+    sqs = sqs or boto3.client("sqs", endpoint_url=config.endpoint_url)  # pyright: ignore[reportUnknownMemberType]
 
     health_server = create_health_server(health, "0.0.0.0", config.health_check_port)
     server_thread = threading.Thread(
@@ -169,18 +214,12 @@ def consume(
     )
     server_thread.start()
     sqs_fetch_thread = threading.Thread(
-        target=_fetch_sqs,
+        target=_fetch_sqs_thread(sqs, shutdown, config, queue_to_process),
         name="sqs_fetch",
         daemon=True,
-        kwargs={
-            "shutdown": shutdown,
-            "config": config,
-            "queue": queue_to_process,
-        },
     )
-    sqs_fetch_thread.start()
 
-    sqs = boto3.client("sqs", endpoint_url=config.endpoint_url)  # pyright: ignore[reportUnknownMemberType]
+    sqs_fetch_thread.start()
 
     log.info(
         "Starting consumption",
@@ -190,7 +229,7 @@ def consume(
     )
     total_messages_processed = 0
 
-    while not shutdown.shutdown_requested.is_set():
+    while not shutdown.shutdown_requested:
         health.heartbeat()
         try:
             m = queue_to_process.get(block=True, timeout=0.2)
@@ -218,21 +257,10 @@ def consume(
         health.heartbeat()
 
     log.info("starting queue shutdown set messages VisibilityTimeout back to 0")
-    while not queue_to_process.empty():
-        try:
-            m = queue_to_process.get_nowait()
-            sqs.change_message_visibility(
-                QueueUrl=config.queue_url,
-                ReceiptHandle=m.receipt,
-                VisibilityTimeout=0,
-            )
-            queue_to_process.task_done()
-        except Empty:
-            break
-        except Exception as e:
-            log.error(f"Failed to return message to SQS: {e}")
-            queue_to_process.task_done()
 
-    sqs.close()
+    sqs_fetch_thread.join(timeout=config.wait_time_seconds + 2)
+    if sqs_fetch_thread.is_alive():
+        log.error("sqs thread still alive after join")
+    _requeue(sqs, _get_all(queue_to_process), config.queue_url)
+
     health_server.shutdown()
-    queue_to_process.join()
