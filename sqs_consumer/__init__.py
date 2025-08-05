@@ -1,4 +1,5 @@
 import dataclasses
+from functools import wraps
 import itertools
 import logging
 import random
@@ -142,28 +143,34 @@ def _fetch_sqs_thread(
     queue: MessageQueue,
 ):
     def run():
-        while not shutdown.shutdown_requested:
-            qsize = queue.qsize()
-            if qsize > config.fetch_min_messages:
-                sleep = random.uniform(config.fetch_min_sleep, config.fetch_max_sleep)
-                log.debug(f"{qsize=} sleep for {sleep:.2f}")
-                time.sleep(sleep)
-                continue
+        try:
+            while not shutdown.shutdown_requested:
+                qsize = queue.qsize()
+                if qsize > config.fetch_min_messages:
+                    sleep = random.uniform(
+                        config.fetch_min_sleep, config.fetch_max_sleep
+                    )
+                    log.debug(f"{qsize=} sleep for {sleep:.2f}")
+                    time.sleep(sleep)
+                    continue
 
-            log.debug("fetching message from sqs")
+                log.debug("fetching message from sqs")
 
-            response = sqs.receive_message(
-                QueueUrl=config.queue_url,
-                WaitTimeSeconds=config.wait_time_seconds,
-                MaxNumberOfMessages=config.max_messages,
-                VisibilityTimeout=config.visibility_timeout,
-            )
-            messages = response.get("Messages", [])
-            log.debug(f"got {len(messages)} from queue")
-            for m in response.get("Messages", []):
-                queue.put_nowait(Message.model_validate(m))
+                response = sqs.receive_message(
+                    QueueUrl=config.queue_url,
+                    WaitTimeSeconds=config.wait_time_seconds,
+                    MaxNumberOfMessages=config.max_messages,
+                    VisibilityTimeout=config.visibility_timeout,
+                )
+                messages = response.get("Messages", [])
+                log.debug(f"got {len(messages)} from queue")
+                for m in response.get("Messages", []):
+                    queue.put_nowait(Message.model_validate(m))
 
-        sqs.close()
+            sqs.close()
+        except Exception:
+            log.exception("failed to fetch sqs message")
+            raise
 
     return run
 
@@ -178,6 +185,7 @@ def _get_all[T](queue: Queue[T]) -> Iterable[T]:
 
 def _requeue(sqs: "SQSClient", msgs: Iterable[Message], queue_url: str):
     for batch in itertools.batched(msgs, 10):
+        log.info(f"resetting VisibilityTimeout for {len(batch)} messages")
         sqs.change_message_visibility_batch(
             QueueUrl=queue_url,
             Entries=[
@@ -199,13 +207,13 @@ def consume(
     shutdown: GracefulShutdown,
     sqs: "SQSClient | None" = None,
 ):
+    start_timestamp = datetime.now(timezone.utc)
     config = config or Config()  # type: ignore
     health = health or Health(
         heartbeat_max_age=timedelta(seconds=config.health_max_age)
     )
     queue_to_process: MessageQueue = Queue(config.max_messages * 3)
     sqs = sqs or boto3.client("sqs", endpoint_url=config.endpoint_url)  # pyright: ignore[reportUnknownMemberType]
-
     health_server = create_health_server(health, "0.0.0.0", config.health_check_port)
     server_thread = threading.Thread(
         target=health_server.serve_forever,
@@ -230,6 +238,11 @@ def consume(
     total_messages_processed = 0
 
     while not shutdown.shutdown_requested:
+        if not sqs_fetch_thread.is_alive():
+            log.error("sqs_fetch_thread is dead shutting down")
+            shutdown.shutdown()
+            break
+
         health.heartbeat()
         try:
             m = queue_to_process.get(block=True, timeout=0.2)
@@ -247,6 +260,7 @@ def consume(
                 "runtime": runtime,
                 "message_id": m.id,
                 "total_messages_processed": total_messages_processed,
+                "uptime": str(datetime.now(timezone.utc) - start_timestamp),
             },
         )
         sqs.delete_message(
@@ -256,11 +270,15 @@ def consume(
         queue_to_process.task_done()
         health.heartbeat()
 
-    log.info("starting queue shutdown set messages VisibilityTimeout back to 0")
+    log.info("shutting down consumer")
 
-    sqs_fetch_thread.join(timeout=config.wait_time_seconds + 2)
+    if sqs_fetch_thread.is_alive():
+        wait_time = config.wait_time_seconds + 2
+        log.info(f"waiting : {wait_time} seconds for sqs_fetch_thread to finish")
+        sqs_fetch_thread.join(timeout=wait_time)
+
     if sqs_fetch_thread.is_alive():
         log.error("sqs thread still alive after join")
-    _requeue(sqs, _get_all(queue_to_process), config.queue_url)
 
+    _requeue(sqs, _get_all(queue_to_process), config.queue_url)
     health_server.shutdown()
