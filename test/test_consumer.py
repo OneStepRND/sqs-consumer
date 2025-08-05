@@ -56,25 +56,30 @@ def health():
 
 
 @pytest.fixture()
-def config(queue_url: str):
+def config(queue_name: str):
     return Config(
-        queue_url=queue_url,
+        queue_name=queue_name,
         wait_time_seconds=0,
         health_check_port=get_free_port(),
     )
 
 
 @pytest.fixture
-def queue_url(sqs: "SQSClient"):
+def queue_name():
+    return "foo"
+
+
+@pytest.fixture
+def sqs_queue_url(sqs: "SQSClient"):
     response = sqs.create_queue(QueueName="foo")
     return response["QueueUrl"]
 
 
-def test_consume(sqs: "SQSClient", config: Config, health: Health):
+def test_consume(sqs: "SQSClient", config: Config, health: Health, sqs_queue_url: str):
     processed_messages: list[str] = []
     test_messages = [
         sqs.send_message(
-            QueueUrl=config.queue_url,
+            QueueUrl=sqs_queue_url,
             MessageBody=f"message number : {i}",
         )
         for i in range(10)
@@ -103,7 +108,7 @@ def test_consume(sqs: "SQSClient", config: Config, health: Health):
     shutdown.shutdown()
     consumer_thread.join(timeout=10)
     assert len(test_messages) == len(processed_messages)
-    response = sqs.receive_message(QueueUrl=config.queue_url, WaitTimeSeconds=0)
+    response = sqs.receive_message(QueueUrl=sqs_queue_url, WaitTimeSeconds=0)
     assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
     with pytest.raises(KeyError):
         response["Messages"]

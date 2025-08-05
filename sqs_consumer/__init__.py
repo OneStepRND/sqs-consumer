@@ -84,7 +84,7 @@ class Config(BaseSettings):
     )
 
     # Required - will be loaded from SQS_QUEUE_URL env var
-    queue_url: str = Field(..., description="SQS queue URL")
+    queue_name: str = Field(..., description="SQS queue NAME")
 
     # Optional - these have the SQS_ prefix automatically added
     endpoint_url: str | None = Field(default=None, description="Custom SQS endpoint")
@@ -141,6 +141,7 @@ def _fetch_sqs_thread(
     shutdown: GracefulShutdown,
     config: Config,
     queue: MessageQueue,
+    queue_url: str,
 ):
     def run():
         try:
@@ -157,7 +158,7 @@ def _fetch_sqs_thread(
                 log.debug("fetching message from sqs")
 
                 response = sqs.receive_message(
-                    QueueUrl=config.queue_url,
+                    QueueUrl=queue_url,
                     WaitTimeSeconds=config.wait_time_seconds,
                     MaxNumberOfMessages=config.max_messages,
                     VisibilityTimeout=config.visibility_timeout,
@@ -214,6 +215,7 @@ def consume(
     )
     queue_to_process: MessageQueue = Queue(config.max_messages * 3)
     sqs = sqs or boto3.client("sqs", endpoint_url=config.endpoint_url)  # pyright: ignore[reportUnknownMemberType]
+    queue_url = sqs.get_queue_url(QueueName=config.queue_name)["QueueUrl"]
     health_server = create_health_server(health, "0.0.0.0", config.health_check_port)
     server_thread = threading.Thread(
         target=health_server.serve_forever,
@@ -222,7 +224,13 @@ def consume(
     )
     server_thread.start()
     sqs_fetch_thread = threading.Thread(
-        target=_fetch_sqs_thread(sqs, shutdown, config, queue_to_process),
+        target=_fetch_sqs_thread(
+            sqs,
+            shutdown,
+            config,
+            queue_to_process,
+            queue_url,
+        ),
         name="sqs_fetch",
         daemon=True,
     )
@@ -230,7 +238,7 @@ def consume(
     sqs_fetch_thread.start()
 
     log.info(
-        "Starting consumption",
+        f"Starting consumption : {queue_url}",
         extra={
             "config": config.model_dump(mode="json"),
         },
@@ -264,7 +272,7 @@ def consume(
             },
         )
         sqs.delete_message(
-            QueueUrl=config.queue_url,
+            QueueUrl=queue_url,
             ReceiptHandle=m.receipt,
         )
         queue_to_process.task_done()
@@ -280,5 +288,5 @@ def consume(
     if sqs_fetch_thread.is_alive():
         log.error("sqs thread still alive after join")
 
-    _requeue(sqs, _get_all(queue_to_process), config.queue_url)
+    _requeue(sqs, _get_all(queue_to_process), queue_url)
     health_server.shutdown()
