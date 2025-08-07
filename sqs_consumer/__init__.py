@@ -1,5 +1,6 @@
 import dataclasses
 import itertools
+import json
 import logging
 import random
 import signal
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable
+from botocore.exceptions import ClientError
 
 import boto3
 from pydantic import BaseModel, Field
@@ -103,6 +105,7 @@ class Config(BaseSettings):
     fetch_min_sleep: int = Field(default=int(timedelta(seconds=1).total_seconds()))
     fetch_max_sleep: int = Field(default=int(timedelta(seconds=3).total_seconds()))
     fetch_min_messages: int = Field(default=5)
+    max_retries_until_dlq: int = Field(default=3)
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -133,6 +136,44 @@ def create_health_server(health: Health, host: str, port: int) -> HTTPServer:
 
     server = HTTPServer((host, port), handler_factory)  # type: ignore
     return server
+
+
+def _get_or_create_queue_url(sqs: "SQSClient", config: Config) -> str:
+    dlq_name = f"{config.queue_name}-dlq"
+    max_retention = str(int(timedelta(days=14).total_seconds()))
+    try:
+        dlq = sqs.create_queue(
+            QueueName=dlq_name,
+            Attributes={
+                "MessageRetentionPeriod": max_retention,
+            },
+        )
+
+        queue_arn = sqs.get_queue_attributes(
+            QueueUrl=dlq["QueueUrl"],
+            AttributeNames=["QueueArn"],
+        )["Attributes"]["QueueArn"]
+
+        queue_response = sqs.create_queue(
+            QueueName=config.queue_name,
+            Attributes={
+                "MessageRetentionPeriod": max_retention,
+                "VisibilityTimeout": str(config.visibility_timeout),
+                "ReceiveMessageWaitTimeSeconds": str(config.wait_time_seconds),
+                "RedrivePolicy": json.dumps(
+                    {
+                        "deadLetterTargetArn": queue_arn,
+                        "maxReceiveCount": str(config.max_retries_until_dlq),
+                    }
+                ),
+            },
+        )
+        return queue_response["QueueUrl"]
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "QueueAlreadyExists":
+            return sqs.get_queue_url(QueueName=config.queue_name)["QueueUrl"]
+
+        raise e
 
 
 def _fetch_sqs_thread(
@@ -183,7 +224,7 @@ def _get_all[T](queue: Queue[T]) -> Iterable[T]:
             break
 
 
-def _requeue(sqs: "SQSClient", msgs: Iterable[Message], queue_url: str):
+def requeue(sqs: "SQSClient", msgs: Iterable[Message], queue_url: str):
     for batch in itertools.batched(msgs, 10):
         log.info(f"resetting VisibilityTimeout for {len(batch)} messages")
         sqs.change_message_visibility_batch(
@@ -214,7 +255,7 @@ def consume(
     )
     queue_to_process: MessageQueue = Queue(config.max_messages * 3)
     sqs = sqs or boto3.client("sqs", endpoint_url=config.endpoint_url)  # pyright: ignore[reportUnknownMemberType]
-    queue_url = sqs.create_queue(QueueName=config.queue_name)["QueueUrl"]
+    queue_url = _get_or_create_queue_url(sqs, config)
     health_server = create_health_server(health, "0.0.0.0", config.health_check_port)
     server_thread = threading.Thread(
         target=health_server.serve_forever,
@@ -287,5 +328,5 @@ def consume(
     if sqs_fetch_thread.is_alive():
         log.error("sqs thread still alive after join")
 
-    _requeue(sqs, _get_all(queue_to_process), queue_url)
+    requeue(sqs, _get_all(queue_to_process), queue_url)
     health_server.shutdown()

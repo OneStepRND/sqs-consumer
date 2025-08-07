@@ -18,6 +18,7 @@ from sqs_consumer import (
     Message,
     consume,
     create_health_server,
+    requeue,
 )
 
 
@@ -73,6 +74,54 @@ def queue_name():
 def sqs_queue_url(sqs: "SQSClient"):
     response = sqs.create_queue(QueueName="foo")
     return response["QueueUrl"]
+
+
+def test_requeue(sqs: "SQSClient", sqs_queue_url: str):
+    for i in range(10):
+        sqs.send_message(
+            QueueUrl=sqs_queue_url,
+            MessageBody=f"message number : {i}",
+        )
+    msgs = sqs.receive_message(QueueUrl=sqs_queue_url, MaxNumberOfMessages=10)[
+        "Messages"
+    ]
+    assert len(msgs) == 10
+    with pytest.raises(KeyError):
+        sqs.receive_message(QueueUrl=sqs_queue_url, MaxNumberOfMessages=10)["Messages"]
+
+    requeue(
+        sqs,
+        [Message.model_validate(x) for x in msgs],
+        sqs_queue_url,
+    )
+    msgs = sqs.receive_message(QueueUrl=sqs_queue_url, MaxNumberOfMessages=10)[
+        "Messages"
+    ]
+    assert len(msgs) == 10
+
+
+def test_consume_with_create_queue(sqs: "SQSClient", config: Config, health: Health):
+    def handler(message: Message):
+        pass
+
+    shutdown = GracefulShutdown()
+    consumer_thread = threading.Thread(
+        target=consume,
+        kwargs={
+            "handler": handler,
+            "config": config,
+            "shutdown": shutdown,
+            "health": health,
+            "sqs": sqs,
+        },
+    )
+    consumer_thread.start()
+    timeout = time.time() + 5
+    while not health.healthy and time.time() <= timeout:
+        time.sleep(0.1)
+    assert health.healthy
+    shutdown.shutdown()
+    consumer_thread.join(timeout=10)
 
 
 def test_consume(sqs: "SQSClient", config: Config, health: Health, sqs_queue_url: str):
