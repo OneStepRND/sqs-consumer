@@ -215,7 +215,7 @@ def consume(
     )
     queue_to_process: MessageQueue = Queue(config.max_messages * 3)
     sqs = sqs or boto3.client("sqs", endpoint_url=config.endpoint_url)  # pyright: ignore[reportUnknownMemberType]
-    queue_url = sqs.get_queue_url(QueueName=config.queue_name)["QueueUrl"]
+    queue_url = sqs.create_queue(QueueName=config.queue_name)["QueueUrl"]
     health_server = create_health_server(health, "0.0.0.0", config.health_check_port)
     server_thread = threading.Thread(
         target=health_server.serve_forever,
