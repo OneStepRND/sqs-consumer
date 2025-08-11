@@ -45,6 +45,7 @@ jobs:
 
     - name: Upload wheel
       uses: actions/upload-artifact@v4
+      if: github.ref == 'refs/heads/main'
       with:
         name: wheel
         path: dist/*.whl
@@ -54,7 +55,7 @@ jobs:
   create-release:
     needs: build-wheel
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
       contents: write
 
@@ -67,6 +68,15 @@ jobs:
         VERSION=$(grep -Po 'version = "\K[^"]+' pyproject.toml)
         echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+    - name: Check if tag exists
+      id: check_tag
+      run: |
+        if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
     - name: Download all artifacts
       uses: actions/download-artifact@v4
       with:
@@ -76,6 +86,7 @@ jobs:
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
+      if: steps.check_tag.outputs.exists == 'false'
       with:
         tag_name: v${{ steps.version.outputs.version }}
         name: Release v${{ steps.version.outputs.version }}
