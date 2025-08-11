@@ -60,6 +60,7 @@ def health():
 def config(queue_name: str):
     return Config(
         queue_name=queue_name,
+        dlq_queue_name=f"{queue_name}-dlq",
         wait_time_seconds=0,
         health_check_port=get_free_port(),
     )

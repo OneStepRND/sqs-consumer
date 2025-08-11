@@ -86,6 +86,7 @@ class Config(BaseSettings):
 
     # Required - will be loaded from SQS_QUEUE_URL env var
     queue_name: str = Field(..., description="SQS queue NAME")
+    dlq_queue_name: str = Field(..., description="SQS dead letter queue NAME")
 
     # Optional - these have the SQS_ prefix automatically added
     endpoint_url: str | None = Field(default=None, description="Custom SQS endpoint")
@@ -139,11 +140,10 @@ def create_health_server(health: Health, host: str, port: int) -> HTTPServer:
 
 
 def _get_or_create_queue_url(sqs: "SQSClient", config: Config) -> str:
-    dlq_name = f"{config.queue_name}-dlq"
     max_retention = str(int(timedelta(days=14).total_seconds()))
     try:
         dlq = sqs.create_queue(
-            QueueName=dlq_name,
+            QueueName=config.dlq_queue_name,
             Attributes={
                 "MessageRetentionPeriod": max_retention,
             },
