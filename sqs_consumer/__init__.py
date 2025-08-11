@@ -127,6 +127,14 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200 if self.health.healthy else 503)
         self.end_headers()
 
+    def do_HEAD(self):
+        """Handle HEAD requests by sending the same response as GET but without body."""
+        if self.path != "/health":
+            self.send_error(404)
+            return
+        self.send_response(200 if self.health.healthy else 503)
+        self.end_headers()
+
 
 def create_health_server(health: Health, host: str, port: int) -> HTTPServer:
     """Create an HTTP server for health checks."""
