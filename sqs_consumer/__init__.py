@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from botocore.exceptions import ClientError
 
 import boto3
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
@@ -107,6 +107,10 @@ class Config(BaseSettings):
     fetch_max_sleep: int = Field(default=int(timedelta(seconds=3).total_seconds()))
     fetch_min_messages: int = Field(default=5)
     max_retries_until_dlq: int = Field(default=3)
+
+    @field_validator("endpoint_url", mode="before")
+    def _empty_str_to_none(cls, value: str | None) -> str | None:
+        return value if value != "" else None
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):

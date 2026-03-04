@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.13"
 
 [[package]]
@@ -587,7 +587,7 @@ wheels = [
 
 [[package]]
 name = "sqs-consumer"
-version = "0.7.0"
+version = "0.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
