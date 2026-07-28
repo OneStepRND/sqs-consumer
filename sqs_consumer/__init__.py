@@ -674,7 +674,11 @@ def _handle_message(
                 "cancel_reason": cancel_reason,
             },
         )
-        if cancel_reason == "max_processing_time" and config.on_error == "crash":
+        if cancel_reason == "shutdown":
+            requeue(sqs, [message], queue_url)
+            return False
+
+        if config.on_error == "crash":
             raise TimeoutError(
                 f"handler of {message.id} exceeded max_processing_time of {config.max_processing_time}s"
             )

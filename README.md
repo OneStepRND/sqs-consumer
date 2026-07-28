@@ -149,9 +149,18 @@ keeps the probe green for as long as it runs.
 On shutdown the consumer stops taking new messages and gives the in-flight
 handler `shutdown_grace_period` seconds before cancelling it the same way. A
 synchronous handler cannot be cancelled, so it runs to completion and its message
-is deleted as usual — the grace period only bounds an async handler. Buffered
-messages that were never handled get their visibility reset so another consumer
-picks them up immediately, on a clean shutdown and on a crash alike.
+is deleted as usual — the grace period only bounds an async handler.
+
+A handler cancelled by shutdown has its message released, as do the messages left
+in the buffer, so the successor picks the work up at once instead of waiting out
+`visibility_timeout`; this holds on a clean shutdown and on a crash alike. A
+message cancelled by `max_processing_time`, or failed under `on_error="continue"`,
+keeps its visibility instead, so its retry is spaced out rather than immediate.
+
+Releasing a message does not reset its `ApproximateReceiveCount`, which SQS
+increments on every receive. Interrupting the same long-running message on
+successive deploys therefore walks it towards the DLQ, so give
+`max_retries_until_dlq` room for the interruptions you expect.
 
 ### Prefetch and Buffering
 

@@ -778,7 +778,8 @@ def test_shutdown_cancels_the_in_flight_async_handler(
 ):
     config = worker_config(queue_name, shutdown_grace_period=0)
     deletes = spy_on(monkeypatch, sqs, "delete_message")
-    sqs.send_message(QueueUrl=sqs_queue_url, MessageBody="endless")
+    released = spy_on(monkeypatch, sqs, "change_message_visibility_batch")
+    sent = sqs.send_message(QueueUrl=sqs_queue_url, MessageBody="endless")
     started = threading.Event()
     cancelled = threading.Event()
 
@@ -799,6 +800,13 @@ def test_shutdown_cancels_the_in_flight_async_handler(
         assert cancelled.wait(TIMEOUT)
 
     assert deletes.items == []
+    assert [entry["Id"] for entry in entries_of(released)] == [sent["MessageId"]], (
+        "the interrupted message must be handed back for the successor to pick up"
+    )
+    assert {entry["VisibilityTimeout"] for entry in entries_of(released)} == {0}
+    assert len(receive(sqs, sqs_queue_url)) == 1, (
+        "it must be receivable at once, not after the visibility timeout"
+    )
 
 
 def test_shutdown_deletes_the_message_of_a_sync_handler_that_ran_past_the_grace_period(
