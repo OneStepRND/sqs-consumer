@@ -540,15 +540,14 @@ def test_requeue_logs_the_failed_entries(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ):
-    monkeypatch.setattr(
-        sqs,
-        "change_message_visibility_batch",
-        lambda **_: {
+    def reject_the_batch(**_: Any) -> dict[str, Any]:
+        return {
             "Failed": [
                 {"Id": "id-0", "Message": "ReceiptHandleIsInvalid", "SenderFault": True}
             ]
-        },
-    )
+        }
+
+    monkeypatch.setattr(sqs, "change_message_visibility_batch", reject_the_batch)
 
     requeue(sqs, [message()], sqs_queue_url)
 
@@ -651,9 +650,11 @@ def test_async_handler_reuses_one_event_loop(
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
 def test_with_signal_requests_shutdown(monkeypatch: pytest.MonkeyPatch, signum: int):
     handlers: dict[int, Any] = {}
-    monkeypatch.setattr(
-        signal, "signal", lambda num, handler: handlers.__setitem__(num, handler)
-    )
+
+    def record_handler(num: int, handler: Any) -> None:
+        handlers[num] = handler
+
+    monkeypatch.setattr(signal, "signal", record_handler)
 
     shutdown = GracefulShutdown.with_signal()
 
@@ -679,7 +680,11 @@ def test_consume_closes_a_client_it_created(
 ):
     client = Mock(spec=SQSClient)
     client.receive_message.return_value = {}
-    monkeypatch.setattr(boto3, "client", lambda *_, **__: client)
+
+    def build_client(*_: Any, **__: Any) -> Any:
+        return client
+
+    monkeypatch.setattr(boto3, "client", build_client)
     shutdown = GracefulShutdown()
     shutdown.shutdown()
 
