@@ -136,17 +136,18 @@ def running_consumer(
         thread.join(timeout=15)
 
 
-def queue_depth(sqs: "SQSClient", queue_url: str) -> int:
-    attributes = sqs.get_queue_attributes(
-        QueueUrl=queue_url,
-        AttributeNames=[
-            "ApproximateNumberOfMessages",
-            "ApproximateNumberOfMessagesNotVisible",
-        ],
-    )["Attributes"]
-    return int(attributes["ApproximateNumberOfMessages"]) + int(
-        attributes["ApproximateNumberOfMessagesNotVisible"]
-    )
+class DeleteSpy:
+    """Records the messages the consumer deleted, the ones it considers handled."""
+
+    def __init__(self, sqs: "SQSClient"):
+        self.deleted: list[str] = []
+        original = sqs.delete_message
+
+        def record(**kwargs: Any) -> Any:
+            self.deleted.append(str(kwargs["ReceiptHandle"]))
+            return original(**kwargs)
+
+        setattr(sqs, "delete_message", record)
 
 
 class VisibilitySpy:
@@ -319,6 +320,7 @@ def test_health_server(health: Health, config: Config):
 def test_consume_async_handler(
     sqs: "SQSClient", config: Config, health: Health, sqs_queue_url: str
 ):
+    deletes = DeleteSpy(sqs)
     processed: list[str] = []
     sent = [
         sqs.send_message(QueueUrl=sqs_queue_url, MessageBody=f"message number : {i}")
@@ -338,7 +340,7 @@ def test_consume_async_handler(
         thread.join(timeout=15)
         assert not thread.is_alive()
 
-    assert queue_depth(sqs, sqs_queue_url) == 0
+    assert len(deletes.deleted) == len(sent)
 
 
 def test_visibility_heartbeat_extends_the_in_flight_message(
@@ -387,6 +389,7 @@ def test_max_processing_time_cancels_the_handler_and_keeps_the_message(
     sqs: "SQSClient", health: Health, sqs_queue_url: str, queue_name: str
 ):
     config = worker_config(queue_name, max_processing_time=1, on_error="continue")
+    deletes = DeleteSpy(sqs)
     sqs.send_message(QueueUrl=sqs_queue_url, MessageBody="endless")
     cancelled = threading.Event()
 
@@ -403,7 +406,7 @@ def test_max_processing_time_cancels_the_handler_and_keeps_the_message(
     ):
         assert wait_for(cancelled.is_set, timeout=15)
         assert thread.is_alive()
-        assert queue_depth(sqs, sqs_queue_url) == 1
+        assert deletes.deleted == []
 
 
 def test_max_processing_time_requires_an_async_handler(
@@ -428,6 +431,7 @@ def test_shutdown_cancels_the_in_flight_async_handler(
     sqs: "SQSClient", health: Health, sqs_queue_url: str, queue_name: str
 ):
     config = worker_config(queue_name, shutdown_grace_period=1)
+    deletes = DeleteSpy(sqs)
     sqs.send_message(QueueUrl=sqs_queue_url, MessageBody="endless")
     started = threading.Event()
     cancelled = threading.Event()
@@ -450,13 +454,14 @@ def test_shutdown_cancels_the_in_flight_async_handler(
         thread.join(timeout=15)
         assert not thread.is_alive()
 
-    assert queue_depth(sqs, sqs_queue_url) == 1
+    assert deletes.deleted == []
 
 
 def test_shutdown_deletes_the_message_of_a_sync_handler_that_ran_past_the_grace_period(
     sqs: "SQSClient", health: Health, sqs_queue_url: str, queue_name: str
 ):
     config = worker_config(queue_name, shutdown_grace_period=0)
+    deletes = DeleteSpy(sqs)
     sqs.send_message(QueueUrl=sqs_queue_url, MessageBody="slow")
     started = threading.Event()
     handled = threading.Event()
@@ -476,13 +481,14 @@ def test_shutdown_deletes_the_message_of_a_sync_handler_that_ran_past_the_grace_
         thread.join(timeout=15)
         assert not thread.is_alive()
 
-    assert queue_depth(sqs, sqs_queue_url) == 0
+    assert len(deletes.deleted) == 1
 
 
 def test_bounded_prefetch_keeps_the_fetch_thread_alive(
     sqs: "SQSClient", health: Health, sqs_queue_url: str, queue_name: str
 ):
     config = worker_config(queue_name, fetch_min_sleep=0, fetch_max_sleep=1)
+    deletes = DeleteSpy(sqs)
     for i in range(5):
         sqs.send_message(QueueUrl=sqs_queue_url, MessageBody=f"message number : {i}")
     processed: list[str] = []
@@ -499,7 +505,7 @@ def test_bounded_prefetch_keeps_the_fetch_thread_alive(
         assert not shutdown.shutdown_requested
         assert thread.is_alive()
 
-    assert queue_depth(sqs, sqs_queue_url) == 0
+    assert len(deletes.deleted) == 5
 
 
 def test_consume_with_pre_provisioned_queue_url(
@@ -558,6 +564,7 @@ def test_on_error_continue_keeps_consuming(
     )
     for body in ("fail", "ok-1", "ok-2"):
         sqs.send_message(QueueUrl=sqs_queue_url, MessageBody=body)
+    deletes = DeleteSpy(sqs)
     succeeded: list[str] = []
     failed: list[str] = []
 
@@ -576,13 +583,14 @@ def test_on_error_continue_keeps_consuming(
         assert thread.is_alive()
         assert not shutdown.shutdown_requested
 
-    assert queue_depth(sqs, sqs_queue_url) == 1
+    assert len(deletes.deleted) == len(succeeded)
 
 
 def test_on_error_crash_terminates_the_consumer(
     sqs: "SQSClient", config: Config, health: Health, sqs_queue_url: str
 ):
     assert config.on_error == "crash"
+    deletes = DeleteSpy(sqs)
     sqs.send_message(QueueUrl=sqs_queue_url, MessageBody="boom")
     shutdown = GracefulShutdown()
 
@@ -599,7 +607,7 @@ def test_on_error_crash_terminates_the_consumer(
         )
 
     shutdown.shutdown()
-    assert queue_depth(sqs, sqs_queue_url) == 1
+    assert deletes.deleted == []
 
 
 def test_fifo_queue_creation(sqs: "SQSClient"):
