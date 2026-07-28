@@ -20,7 +20,6 @@ from moto import mock_aws
 from mypy_boto3_sqs import SQSClient
 from pydantic import ValidationError
 
-import sqs_consumer
 from sqs_consumer import (
     Config,
     GracefulShutdown,
@@ -33,9 +32,12 @@ from sqs_consumer import (
     resolve_queue_url,
     send,
 )
-from sqs_consumer import _fetch_sqs_thread as fetch_sqs_thread
-from sqs_consumer import _has_free_capacity as has_free_capacity
-from sqs_consumer import _InFlightSupervisor as InFlightSupervisor
+from sqs_consumer import consumer as consumer_module
+from sqs_consumer.consumer import (
+    InFlightSupervisor,
+    fetch_sqs_thread,
+    has_free_capacity,
+)
 
 TIMEOUT = 10.0
 """Every blocking wait in this suite is bounded by a condition, never by a sleep."""
@@ -149,7 +151,7 @@ def without_sqs_env(monkeypatch: pytest.MonkeyPatch):
 def fast_supervisor_tick(monkeypatch: pytest.MonkeyPatch):
     """The supervisor polls its deadlines on a wall-clock tick, which only needs to be
     coarse enough in production. Nothing in the suite waits out the default."""
-    monkeypatch.setattr(sqs_consumer, "_SUPERVISOR_TICK", 0.01)
+    monkeypatch.setattr(consumer_module, "SUPERVISOR_TICK", 0.01)
 
 
 @pytest.fixture()
