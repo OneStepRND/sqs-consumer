@@ -88,7 +88,7 @@ export SQS_SHUTDOWN_GRACE_PERIOD=30              # Seconds the in-flight handler
 export SQS_FETCH_MIN_SLEEP=1                     # Min sleep between fetches (seconds)
 export SQS_FETCH_MAX_SLEEP=3                     # Max sleep between fetches (seconds)
 export SQS_FETCH_MIN_MESSAGES=5                  # Min messages in queue before sleeping
-export SQS_MAX_BUFFERED_MESSAGES=30              # Local buffer capacity (max_messages * 3)
+export SQS_MAX_BUFFERED_MESSAGES=30              # Local buffer capacity (default: max_messages * 3)
 
 # Health Check
 export SQS_HEALTH_CHECK_PORT=8080                # Health check HTTP port
@@ -126,10 +126,12 @@ consume(handler=handler, config=config, shutdown=GracefulShutdown.with_signal())
 
 ### Long-Running Handlers
 
-While a handler runs, the consumer extends the visibility of the in-flight
-message every `visibility_timeout / 2` seconds and refreshes the liveness
-heartbeat, so a handler longer than `health_max_age` keeps passing the health
-probe.
+When the handler starts, the consumer extends the visibility of the in-flight
+message immediately — rebasing the visibility window onto the handler rather than
+onto the earlier receive — and then every `visibility_timeout / 2` seconds. It
+refreshes the liveness heartbeat on the same tick, so a handler longer than
+`health_max_age` keeps passing the health probe. `visibility_timeout` therefore
+does not need to exceed your processing time.
 
 `max_processing_time` bounds that: when it is reached the handler task is
 cancelled and the message is left undeleted, so it is redelivered once its
@@ -139,18 +141,25 @@ cancellation. Cancellation requires an async handler — `max_processing_time`
 with a synchronous handler is rejected at startup, since a handler thread cannot
 be interrupted.
 
+Once a handler is past its deadline the heartbeat stops, so a handler that
+ignores cancellation fails the health probe and the orchestrator can replace the
+process. Without `max_processing_time` there is no deadline, and a hung handler
+keeps the probe green for as long as it runs.
+
 On shutdown the consumer stops taking new messages and gives the in-flight
-handler `shutdown_grace_period` seconds before cancelling it the same way; a
-synchronous handler runs to completion and its message is deleted as usual.
-Buffered messages that were never handled get their visibility reset so another
-consumer picks them up immediately.
+handler `shutdown_grace_period` seconds before cancelling it the same way. A
+synchronous handler cannot be cancelled, so it runs to completion and its message
+is deleted as usual — the grace period only bounds an async handler. Buffered
+messages that were never handled get their visibility reset so another consumer
+picks them up immediately, on a clean shutdown and on a crash alike.
 
 ### Prefetch and Buffering
 
 The fetch thread keeps at most `max_buffered_messages` messages in the local
-buffer (`max_messages * 3` by default) and stops receiving while the buffer is
-full. A buffered message gets no visibility extension, so a consumer with long
-handlers should keep the buffer small:
+buffer (`max_messages * 3` by default), stops receiving while the buffer is full,
+and backs off between `fetch_min_sleep` and `fetch_max_sleep` seconds when a poll
+comes back empty. A buffered message gets no visibility extension until its
+handler starts, so a consumer with long handlers should keep the buffer small:
 
 ```python
 config = Config(
@@ -178,13 +187,24 @@ config = Config(
 
 ### FIFO Queues
 
-A `queue_name` ending in `.fifo` is created as a FIFO queue; the DLQ name must
-end in `.fifo` too. SQS serializes delivery per message group while a message of
-that group is in flight, so the receive side is identical to a standard queue.
+A queue identified by a name or URL ending in `.fifo` is treated as a FIFO queue,
+and a `.fifo` name is created as one; the DLQ name must end in `.fifo` too.
 
 ```python
 config = Config(queue_name="repair.fifo", dlq_queue_name="repair-dlq.fifo")
 ```
+
+SQS serializes delivery per message group, but one poll can return several
+messages of the same group at once, and those siblings sit in the local buffer
+behind the one being handled. So that a failure cannot be overtaken by a later
+message of its group, a FIFO consumer releases the rest of its buffer whenever a
+message is not processed successfully; SQS then redelivers the group in order,
+behind the still-invisible failed message. Handling one group at a time with
+`max_messages=1` avoids the round trip.
+
+`send` accepts `group_id` and `dedup_id`, both of which FIFO requires unless the
+queue has `ContentBasedDeduplication` enabled — the library does not set that
+attribute on the queues it creates.
 
 ### Producing Messages
 
@@ -346,12 +366,14 @@ With `create_queues` enabled (the default) and a `queue_name`, the library:
 4. **Handles queue attributes** for optimal performance
 
 With a `queue_url`, or with `create_queues` disabled, the consumer only needs
-`ReceiveMessage`, `DeleteMessage` and `ChangeMessageVisibility` on an already
-provisioned queue.
+`ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility` and
+`ChangeMessageVisibilityBatch` on an already provisioned queue, plus
+`GetQueueUrl` when it resolves the queue by name.
 
 ## Monitoring and Logging
 
-The library uses Python's standard logging with structured extra fields. **Recommended**: Use JSON logging for better observability:
+The library uses Python's standard logging with structured extra fields, so a JSON
+formatter surfaces the per-message `message_id`, `runtime` and `processed` fields.
 
 
 ### Example Consumer Application
@@ -388,6 +410,7 @@ if __name__ == "__main__":
 
 1. **Idempotent Handlers**: Design message handlers to be idempotent in case of retries
 2. **Error Handling**: Catch and handle exceptions in your message handler appropriately
-3. **Timeouts**: Set `visibility_timeout` longer than your maximum processing time
+3. **Timeouts**: Bound handlers with `max_processing_time` rather than by inflating
+   `visibility_timeout`, which the consumer extends for you while the handler runs
 4. **Batch Size**: Adjust `max_messages` based on your processing speed and memory constraints
 5. **Monitoring**: Monitor the health check endpoint and DLQ for stuck messages

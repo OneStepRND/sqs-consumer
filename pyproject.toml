@@ -9,7 +9,7 @@ module-root = ""
 [project]
 name = "sqs-consumer"
 version = "0.11.0"
-description = "Add your description here"
+description = "Consume Amazon SQS queues with health checks, graceful shutdown and dead letter queue support"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -20,6 +20,11 @@ dependencies = [
 
 [tool.pyright]
 typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:datetime.datetime.utcnow:DeprecationWarning:botocore.auth",
+]
 
 [dependency-groups]
 dev = [
