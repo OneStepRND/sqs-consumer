@@ -349,6 +349,12 @@ def handler(message: Message):
     # Receipt handle (for manual operations)
     receipt_handle = message.receipt
 
+    # FIFO message group, None on a standard queue
+    group_id = message.group_id
+
+    # Deliveries so far, 1 on the first
+    receive_count = message.receive_count
+
     # Parse JSON if needed
     import json
     try:
@@ -356,6 +362,28 @@ def handler(message: Message):
         process_data(data)
     except json.JSONDecodeError:
         print(f"Invalid JSON in message {message_id}")
+```
+
+`group_id` lets a FIFO handler publish a follow up into the group it is already
+serialized behind:
+
+```python
+def handler(message: Message):
+    next_step = do_work(message.body)
+    send(sqs, queue_url, next_step, group_id=message.group_id, dedup_id=message.id)
+```
+
+`receive_count` tells a handler which attempt it is on, so the last one before
+the DLQ can be treated differently:
+
+```python
+def handler(message: Message):
+    try:
+        do_work(message.body)
+    except Exception:
+        if message.receive_count == config.max_retries_until_dlq:
+            record_permanent_failure(message.id)
+        raise
 ```
 
 ## Error Handling

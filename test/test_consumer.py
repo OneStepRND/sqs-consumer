@@ -1274,6 +1274,56 @@ def test_config_detects_a_fifo_queue_url():
     assert not Config(queue_url="https://example.com/repair").is_fifo
 
 
+def test_message_reads_the_system_attributes():
+    parsed = Message.model_validate(
+        {
+            "Body": "body",
+            "MessageId": "id-0",
+            "ReceiptHandle": "receipt-0",
+            "Attributes": {"MessageGroupId": "g", "ApproximateReceiveCount": "3"},
+        }
+    )
+
+    assert parsed.group_id == "g"
+    assert parsed.receive_count == 3
+
+
+def test_message_without_system_attributes_leaves_them_unset():
+    parsed = Message.model_validate(
+        {"Body": "body", "MessageId": "id-0", "ReceiptHandle": "receipt-0"}
+    )
+
+    assert parsed.group_id is None
+    assert parsed.receive_count is None
+
+
+def test_the_handler_sees_the_group_and_the_receive_count(
+    sqs: "SQSClient", health: Health
+):
+    config = Config(
+        queue_name="repair.fifo",
+        dlq_queue_name="repair-dlq.fifo",
+        wait_time_seconds=0,
+        on_error="continue",
+        fetch_min_sleep=0,
+        fetch_max_sleep=0.05,
+        health_check_port=get_free_port(),
+    )
+    queue_url = resolve_queue_url(sqs, config)
+    send(sqs, queue_url, "case-1", group_id="widget-7", dedup_id="outbox-1")
+    handled = Recorder()
+
+    with running_consumer(
+        handler=lambda m: handled.add((m.group_id, m.receive_count)),
+        config=config,
+        health=health,
+        sqs=sqs,
+    ):
+        assert handled.wait_for(1)
+
+    assert handled.items == [("widget-7", 1)]
+
+
 def test_send_with_fifo_parameters(sqs: "SQSClient", monkeypatch: pytest.MonkeyPatch):
     queue_url = sqs.create_queue(
         QueueName="repair.fifo", Attributes={"FifoQueue": "true"}

@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol, TypeIs, cast
 
 import boto3
 from botocore.exceptions import ClientError
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasPath, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
@@ -50,6 +50,16 @@ class Message(BaseModel):
     body: str = Field(alias="Body")
     id: str = Field(alias="MessageId")
     receipt: str = Field(alias="ReceiptHandle")
+    group_id: str | None = Field(
+        default=None,
+        validation_alias=AliasPath("Attributes", "MessageGroupId"),
+        description="The FIFO message group, to publish a follow up into the same group",
+    )
+    receive_count: int | None = Field(
+        default=None,
+        validation_alias=AliasPath("Attributes", "ApproximateReceiveCount"),
+        description="Deliveries of this message so far, 1 on the first, compare against max_retries_until_dlq",
+    )
 
 
 _MessageQueue = Queue[Message]
@@ -386,6 +396,10 @@ def _fetch_sqs_thread(
                     WaitTimeSeconds=config.wait_time_seconds,
                     MaxNumberOfMessages=min(config.max_messages, free_capacity),
                     VisibilityTimeout=config.visibility_timeout,
+                    MessageSystemAttributeNames=[
+                        "MessageGroupId",
+                        "ApproximateReceiveCount",
+                    ],
                 )
                 messages = response.get("Messages", [])
                 log.debug(f"got {len(messages)} from queue")
