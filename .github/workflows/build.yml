@@ -70,11 +70,13 @@ jobs:
 
     - name: Check if tag exists
       id: check_tag
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
       run: |
-        if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
-          echo "exists=true" >> $GITHUB_OUTPUT
+        if [ -n "$(git ls-remote --tags origin "refs/tags/v$VERSION")" ]; then
+          echo "exists=true" >> "$GITHUB_OUTPUT"
         else
-          echo "exists=false" >> $GITHUB_OUTPUT
+          echo "exists=false" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Download all artifacts
