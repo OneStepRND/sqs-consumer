@@ -22,8 +22,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-MessageQueue = Queue[Message]
-
 SyncHandler = Callable[[Message], None]
 AsyncHandler = Callable[[Message], Awaitable[None]]
 Handler = SyncHandler | AsyncHandler
@@ -55,10 +53,21 @@ class GracefulShutdown:
         return instance
 
 
-def has_free_capacity(qsize: int, capacity: int, fetch_min_messages: int) -> bool:
-    """Whether the local buffer has room worth filling with another poll."""
+class MessageBuffer(Queue[Message]):
+    """The local prefetch buffer, which counts a message as owned by the process from
+    the poll that fetched it until `task_done` settles it — so the message the consumer
+    has popped and is handling still takes up capacity."""
 
-    return qsize < capacity and qsize <= fetch_min_messages
+    @property
+    def owned(self) -> int:
+        with self.mutex:
+            return self.unfinished_tasks
+
+
+def has_free_capacity(owned: int, capacity: int, fetch_min_messages: int) -> bool:
+    """Whether the process owns few enough messages for another poll to be worth it."""
+
+    return owned < capacity and owned <= fetch_min_messages
 
 
 def fetch_sqs_thread(
@@ -68,7 +77,7 @@ def fetch_sqs_thread(
     drained: threading.Event,
     shutdown: GracefulShutdown,
     config: Config,
-    queue: MessageQueue,
+    queue: MessageBuffer,
     queue_url: str,
     backoff: Callable[[threading.Event], None] | None = None,
 ) -> Callable[[], None]:
@@ -80,12 +89,12 @@ def fetch_sqs_thread(
     def run() -> None:
         try:
             while not (stop.is_set() or shutdown.shutdown_requested):
-                qsize = queue.qsize()
-                free_capacity = max(queue.maxsize - qsize, 0)
+                owned = queue.owned
+                free_capacity = max(queue.maxsize - owned, 0)
                 if not has_free_capacity(
-                    qsize, queue.maxsize, config.fetch_min_messages
+                    owned, queue.maxsize, config.fetch_min_messages
                 ):
-                    log.debug(f"{qsize=} {free_capacity=} waiting for the consumer")
+                    log.debug(f"{owned=} {free_capacity=} waiting for the consumer")
                     pause(drained)
                     drained.clear()
                     continue
@@ -124,12 +133,15 @@ def fetch_sqs_thread(
     return run
 
 
-def _get_all[T](queue: Queue[T]) -> Iterable[T]:
+def _drain(queue: MessageBuffer) -> Iterable[Message]:
     while True:
         try:
-            yield queue.get_nowait()
+            message = queue.get_nowait()
         except Empty:
             break
+
+        queue.task_done()
+        yield message
 
 
 def _is_async_handler(handler: Handler) -> TypeIs[AsyncHandler]:
@@ -415,7 +427,7 @@ def consume(
     health = health or Health(
         heartbeat_max_age=timedelta(seconds=config.health_max_age)
     )
-    queue_to_process: MessageQueue = Queue(config.buffer_capacity)
+    queue_to_process = MessageBuffer(config.buffer_capacity)
     owns_client = sqs is None
     sqs = sqs or boto3.client("sqs", endpoint_url=config.endpoint_url)  # pyright: ignore[reportUnknownMemberType]
     queue_url = resolve_queue_url(sqs, config)
@@ -499,7 +511,7 @@ def consume(
                     f"releasing the messages buffered behind {m.id} to preserve the FIFO order",
                     extra={"message_id": m.id},
                 )
-                requeue(sqs, _get_all(queue_to_process), queue_url)
+                requeue(sqs, _drain(queue_to_process), queue_url)
 
             health.heartbeat()
     finally:
@@ -514,7 +526,7 @@ def consume(
         if sqs_fetch_thread.is_alive():
             log.error("sqs thread still alive after join")
 
-        requeue(sqs, _get_all(queue_to_process), queue_url)
+        requeue(sqs, _drain(queue_to_process), queue_url)
         invoker.close()
         health_server.shutdown()
         health_server.server_close()

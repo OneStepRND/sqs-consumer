@@ -76,13 +76,17 @@ def requeue(sqs: "SQSClient", msgs: Iterable[Message], queue_url: str) -> None:
             )
 
 
+QUEUE_EXISTS_CODES = frozenset({"QueueAlreadyExists", "QueueNameExists"})
+"""SQS reports a name taken by a queue with other attributes under either code."""
+
+
 def _create_queue(
     sqs: "SQSClient", name: str, attributes: dict["QueueAttributeNameType", str]
 ) -> str:
     try:
         return sqs.create_queue(QueueName=name, Attributes=attributes)["QueueUrl"]
     except ClientError as e:
-        if e.response.get("Error", {}).get("Code") != "QueueAlreadyExists":
+        if e.response.get("Error", {}).get("Code") not in QUEUE_EXISTS_CODES:
             raise
 
         log.warning(
