@@ -23,7 +23,7 @@ A simple Python library for consuming messages from Amazon SQS queues with built
 Install directly from the GitHub release:
 
 ```bash
-pip install https://github.com/OneStepRND/sqs-consumer/releases/download/v0.11.0/sqs_consumer-0.11.0-py3-none-any.whl
+pip install https://github.com/OneStepRND/sqs-consumer/releases/download/v0.12.0/sqs_consumer-0.12.0-py3-none-any.whl
 ```
 
 ## Quick Start
@@ -88,7 +88,7 @@ export SQS_SHUTDOWN_GRACE_PERIOD=30              # Seconds the in-flight handler
 export SQS_FETCH_MIN_SLEEP=1                     # Min sleep between fetches (seconds)
 export SQS_FETCH_MAX_SLEEP=3                     # Max sleep between fetches (seconds)
 export SQS_FETCH_MIN_MESSAGES=5                  # Min messages in queue before sleeping
-export SQS_MAX_BUFFERED_MESSAGES=30              # Local buffer capacity (default: max_messages * 3)
+export SQS_MAX_BUFFERED_MESSAGES=30              # Messages owned at once, buffered plus in flight (default: max_messages * 3)
 
 # Health Check
 export SQS_HEALTH_CHECK_PORT=8080                # Health check HTTP port
@@ -164,11 +164,16 @@ successive deploys therefore walks it towards the DLQ, so give
 
 ### Prefetch and Buffering
 
-The fetch thread keeps at most `max_buffered_messages` messages in the local
-buffer (`max_messages * 3` by default), stops receiving while the buffer is full,
-and backs off between `fetch_min_sleep` and `fetch_max_sleep` seconds when a poll
-comes back empty. A buffered message gets no visibility extension until its
-handler starts, so a consumer with long handlers should keep the buffer small:
+`max_buffered_messages` bounds the messages the process owns (`max_messages * 3`
+by default) — the ones waiting in the local buffer plus the one the handler is
+working on. The fetch thread stops receiving once that many are owned, and backs
+off between `fetch_min_sleep` and `fetch_max_sleep` seconds when a poll comes back
+empty.
+
+A buffered message gets no visibility extension until its handler starts, so its
+receipt handle expires behind a handler that outlasts `visibility_timeout`. A
+consumer with long handlers should therefore set a capacity of 1, which prefetches
+nothing while a handler runs:
 
 ```python
 config = Config(

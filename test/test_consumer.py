@@ -7,7 +7,6 @@ import socket
 import threading
 from collections.abc import Callable, Iterator
 from datetime import timedelta
-from queue import Queue
 from typing import Any, NamedTuple
 from unittest.mock import Mock
 
@@ -35,6 +34,7 @@ from sqs_consumer import (
 from sqs_consumer import consumer as consumer_module
 from sqs_consumer.consumer import (
     InFlightSupervisor,
+    MessageBuffer,
     fetch_sqs_thread,
     has_free_capacity,
 )
@@ -185,6 +185,20 @@ def config(queue_name: str):
 @pytest.fixture
 def sqs_queue_url(sqs: "SQSClient", queue_name: str):
     return sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+
+
+@pytest.fixture
+def fetch_cycles(monkeypatch: pytest.MonkeyPatch) -> Recorder:
+    """Records every backoff the fetch loop takes and shortens it to nothing, so a test
+    can wait out fetch cycles by their count instead of by the clock."""
+    cycles = Recorder()
+
+    def instant(a: float, b: float) -> float:
+        cycles.add((a, b))
+        return 0.0
+
+    monkeypatch.setattr(consumer_module.random, "uniform", instant)
+    return cycles
 
 
 def worker_config(queue_name: str, **overrides: Any) -> Config:
@@ -402,7 +416,7 @@ def test_supervisor_does_not_try_to_cancel_a_sync_handler(
 
 
 @pytest.mark.parametrize(
-    ("qsize", "capacity", "fetch_min_messages", "expected"),
+    ("owned", "capacity", "fetch_min_messages", "expected"),
     [
         (0, 30, 5, True),
         (5, 30, 5, True),
@@ -413,24 +427,43 @@ def test_supervisor_does_not_try_to_cancel_a_sync_handler(
     ],
 )
 def test_has_free_capacity(
-    qsize: int, capacity: int, fetch_min_messages: int, expected: bool
+    owned: int, capacity: int, fetch_min_messages: int, expected: bool
 ):
-    assert has_free_capacity(qsize, capacity, fetch_min_messages) is expected
+    assert has_free_capacity(owned, capacity, fetch_min_messages) is expected
+
+
+def buffer_with_one_in_flight(capacity: int) -> MessageBuffer:
+    """A buffer whose only message the consumer has popped and is still handling."""
+    buffer = MessageBuffer(capacity)
+    buffer.put_nowait(message())
+    buffer.get_nowait()
+    return buffer
+
+
+def test_the_buffer_counts_the_popped_message_until_it_is_settled():
+    buffer = buffer_with_one_in_flight(capacity=1)
+
+    assert buffer.qsize() == 0
+    assert buffer.owned == 1
+
+    buffer.task_done()
+
+    assert buffer.owned == 0
 
 
 class FetchRun(NamedTuple):
-    buffer: Queue[Message]
+    buffer: MessageBuffer
     paused_on: list[threading.Event]
     drained: threading.Event
     stop: threading.Event
 
 
 def run_fetch_loop(
-    sqs: Any, config: Config, *, backoffs: int, buffer: Queue[Message] | None = None
+    sqs: Any, config: Config, *, backoffs: int, buffer: MessageBuffer | None = None
 ) -> FetchRun:
     """Drives the fetch loop on this thread, stopping it after `backoffs` pauses."""
     run = FetchRun(
-        buffer=buffer if buffer is not None else Queue(config.buffer_capacity),
+        buffer=buffer if buffer is not None else MessageBuffer(config.buffer_capacity),
         paused_on=[],
         drained=threading.Event(),
         stop=threading.Event(),
@@ -469,7 +502,7 @@ def test_fetch_polls_once_per_backoff_while_the_queue_is_empty():
 def test_fetch_waits_for_the_consumer_to_drain_a_full_buffer():
     sqs = Mock(spec=SQSClient)
     config = Config(queue_url="https://example.com/q", max_buffered_messages=1)
-    buffer: Queue[Message] = Queue(config.buffer_capacity)
+    buffer = MessageBuffer(config.buffer_capacity)
     buffer.put_nowait(message())
 
     run = run_fetch_loop(sqs, config, backoffs=1, buffer=buffer)
@@ -478,13 +511,49 @@ def test_fetch_waits_for_the_consumer_to_drain_a_full_buffer():
     assert run.paused_on == [run.drained], "it must wake as soon as the consumer drains"
 
 
+def test_fetch_does_not_prefetch_behind_the_in_flight_message():
+    """A message the consumer popped still occupies capacity: a prefetch behind it gets
+    no visibility extension, so its receipt handle expires under a long handler."""
+    sqs = Mock(spec=SQSClient)
+    config = Config(queue_url="https://example.com/q", max_buffered_messages=1)
+
+    run = run_fetch_loop(
+        sqs,
+        config,
+        backoffs=1,
+        buffer=buffer_with_one_in_flight(config.buffer_capacity),
+    )
+
+    sqs.receive_message.assert_not_called()
+    assert run.paused_on == [run.drained], (
+        "it must wake as soon as the consumer settles"
+    )
+
+
+def test_fetch_prefetches_alongside_the_in_flight_message_when_capacity_allows():
+    sqs = Mock(spec=SQSClient)
+    sqs.receive_message.return_value = {}
+    config = Config(
+        queue_url="https://example.com/q", max_messages=10, max_buffered_messages=3
+    )
+
+    run_fetch_loop(
+        sqs,
+        config,
+        backoffs=1,
+        buffer=buffer_with_one_in_flight(config.buffer_capacity),
+    )
+
+    assert sqs.receive_message.call_args.kwargs["MaxNumberOfMessages"] == 2
+
+
 def test_fetch_clamps_the_poll_to_the_free_capacity():
     sqs = Mock(spec=SQSClient)
     sqs.receive_message.return_value = {}
     config = Config(
         queue_url="https://example.com/q", max_messages=10, max_buffered_messages=3
     )
-    buffer: Queue[Message] = Queue(config.buffer_capacity)
+    buffer = MessageBuffer(config.buffer_capacity)
     buffer.put_nowait(message(1))
 
     run_fetch_loop(sqs, config, backoffs=1, buffer=buffer)
@@ -869,13 +938,17 @@ def test_shutdown_releases_the_buffered_backlog(
         _,
     ):
         assert started.wait(TIMEOUT)
-        assert delivered.wait_for(4), "the fetch thread never filled the buffer"
+        assert delivered.wait_for(3), "the fetch thread never filled the buffer"
         shutdown.shutdown()
         release.set()
 
-    assert len(entries_of(released)) == 3, "every buffered message must be released"
+    assert len(entries_of(released)) == 2, (
+        "the capacity covers the in-flight message, so two are buffered behind it"
+    )
     assert {entry["VisibilityTimeout"] for entry in entries_of(released)} == {0}
-    assert len(receive(sqs, sqs_queue_url, MaxNumberOfMessages=10)) == 3
+    assert len(receive(sqs, sqs_queue_url, MaxNumberOfMessages=10)) == 3, (
+        "the two released, plus the one the capacity never admitted"
+    )
 
 
 def test_max_processing_time_cancels_the_handler_and_keeps_the_message(
@@ -970,6 +1043,62 @@ def test_bounded_prefetch_drains_the_whole_queue(
     assert all(
         call["MaxNumberOfMessages"] <= config.buffer_capacity for call in received.items
     )
+
+
+@contextlib.contextmanager
+def blocking_handler() -> Iterator[tuple[Handler, threading.Event, threading.Event]]:
+    """A handler that parks on the first message until the test releases it."""
+    handling = threading.Event()
+    release = threading.Event()
+
+    def handler(m: Message) -> None:
+        handling.set()
+        assert release.wait(TIMEOUT), "the handler was never released"
+
+    try:
+        yield handler, handling, release
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    ("max_buffered_messages", "owned_while_handling"),
+    [(1, 1), (2, 2)],
+)
+def test_the_capacity_bounds_the_messages_the_process_owns(
+    sqs: "SQSClient",
+    health: Health,
+    sqs_queue_url: str,
+    queue_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    fetch_cycles: Recorder,
+    max_buffered_messages: int,
+    owned_while_handling: int,
+):
+    """A capacity of 1 leaves nothing prefetched behind the handler, and a larger one
+    still prefetches — up to the capacity, the in-flight message included."""
+    config = worker_config(queue_name, max_buffered_messages=max_buffered_messages)
+    delivered = spy_on_delivered_messages(monkeypatch, sqs)
+    for i in range(4):
+        sqs.send_message(QueueUrl=sqs_queue_url, MessageBody=f"message number : {i}")
+
+    with blocking_handler() as (handler, handling, release):
+        with running_consumer(
+            handler=handler, config=config, health=health, sqs=sqs
+        ) as (shutdown, _):
+            assert handling.wait(TIMEOUT)
+            assert delivered.wait_for(owned_while_handling)
+            settled = len(fetch_cycles)
+            assert fetch_cycles.wait_for(settled + 3), (
+                "the fetch loop must keep looping while the handler runs"
+            )
+
+            assert len(delivered) == owned_while_handling, (
+                "no message may be received beyond the capacity while a handler runs"
+            )
+            assert not shutdown.shutdown_requested
+            release.set()
+            assert delivered.wait_for(4)
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
@@ -1200,6 +1329,43 @@ def test_an_existing_queue_keeps_its_attributes(
             QueueUrl=existing, AttributeNames=["VisibilityTimeout"]
         )["Attributes"]["VisibilityTimeout"]
         == "42"
+    )
+    assert "already exists with different attributes" in caplog.text
+
+
+@pytest.mark.parametrize("code", ["QueueAlreadyExists", "QueueNameExists"])
+def test_attribute_drift_on_an_existing_queue_is_not_fatal(
+    sqs: "SQSClient",
+    queue_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    code: str,
+):
+    """SQS and ElasticMQ report a name taken by a queue with other attributes under
+    either code, and neither may crash a consumer that creates its own queues."""
+    sqs.create_queue(QueueName=f"{queue_name}-dlq")
+    existing = sqs.create_queue(
+        QueueName=queue_name, Attributes={"VisibilityTimeout": "300"}
+    )["QueueUrl"]
+
+    def drifted(**_: Any) -> Any:
+        raise ClientError(
+            {"Error": {"Code": code, "Message": "attributes differ"}}, "CreateQueue"
+        )
+
+    monkeypatch.setattr(sqs, "create_queue", drifted)
+    config = Config(
+        queue_name=queue_name,
+        dlq_queue_name=f"{queue_name}-dlq",
+        visibility_timeout=900,
+    )
+
+    assert resolve_queue_url(sqs, config) == existing
+    assert (
+        sqs.get_queue_attributes(
+            QueueUrl=existing, AttributeNames=["VisibilityTimeout"]
+        )["Attributes"]["VisibilityTimeout"]
+        == "300"
     )
     assert "already exists with different attributes" in caplog.text
 
