@@ -12,8 +12,12 @@ from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, Callable, Literal, Protocol, TypeIs, cast
 
 import boto3
-from botocore.exceptions import ConnectionError as BotoConnectionError
-from botocore.exceptions import HTTPClientError
+from botocore.exceptions import (
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 
 from sqs_consumer.config import Config
 from sqs_consumer.health import Health, create_health_server
@@ -32,9 +36,15 @@ CancelReason = Literal["max_processing_time", "shutdown"]
 
 SUPERVISOR_TICK = 0.5
 
-UNREACHABLE_ERRORS = (BotoConnectionError, HTTPClientError)
+UNREACHABLE_ERRORS = (
+    EndpointConnectionError,
+    ConnectTimeoutError,
+    ReadTimeoutError,
+    ConnectionClosedError,
+)
 """What botocore raises, once its own retries are spent, when it cannot reach the endpoint
-or loses the connection to it: a broker that is restarting or moving, not a wrong setting."""
+or loses the connection to it: a broker that is restarting or moving. TLS and proxy errors
+are left out on purpose, they are settings to fix and must fail at once."""
 
 OUTAGE_RETRY_FIRST = 1.0
 OUTAGE_RETRY_MAX = 15.0
@@ -56,6 +66,18 @@ def _pause_unless_shutdown(shutdown: "GracefulShutdown", seconds: float) -> bool
     return shutdown.shutdown_requested
 
 
+def _pause_and_heartbeat(
+    shutdown: "GracefulShutdown", health: Health, seconds: float
+) -> bool:
+    """A pause of the main loop, which owns the heartbeat: the liveness probe must see a
+    consumer waiting out an outage as alive, not as hung."""
+
+    health.heartbeat()
+    interrupted = _pause_unless_shutdown(shutdown, seconds)
+    health.heartbeat()
+    return interrupted
+
+
 def through_outage[T](
     call: Callable[[], T],
     *,
@@ -65,17 +87,22 @@ def through_outage[T](
 ) -> T | None:
     """Runs `call`, retrying it while the SQS endpoint cannot be reached, for at most `limit`
     seconds of one outage; past that the last error propagates. Every failed attempt is
-    logged with its traceback. Returns None when `interrupted` reports a stop during a pause."""
+    logged with its traceback. Returns None when `interrupted` reports a stop during a pause.
+
+    botocore's own retry settings could stretch a call over the outage too, but a call
+    retrying inside botocore can't be cut short by a shutdown and logs its retries only at
+    debug level, so the outage is ridden out here, between calls."""
 
     outage_start: float | None = None
     delay = OUTAGE_RETRY_FIRST
     while True:
+        attempt_start = time.monotonic()
         try:
             result = call()
         except UNREACHABLE_ERRORS:
             now = time.monotonic()
             if outage_start is None:
-                outage_start = now
+                outage_start = attempt_start
             elapsed = now - outage_start
             if elapsed >= limit:
                 log.error(
@@ -153,6 +180,7 @@ def fetch_sqs_thread(
     queue: MessageBuffer,
     queue_url: str,
     backoff: Callable[[threading.Event], None] | None = None,
+    failed: threading.Event | None = None,
 ) -> Callable[[], None]:
     def jittered_backoff(until: threading.Event) -> None:
         until.wait(random.uniform(config.fetch_min_sleep, config.fetch_max_sleep))
@@ -204,12 +232,21 @@ def fetch_sqs_thread(
                             f"local buffer is full, releasing {message.id}",
                             extra={"message_id": message.id},
                         )
-                        requeue(sqs, [message], queue_url)
+                        through_outage(
+                            lambda: requeue(sqs, [message], queue_url),
+                            what=f"releasing {message.id}",
+                            limit=config.endpoint_outage_limit,
+                            interrupted=lambda seconds: (
+                                stop.wait(seconds) or shutdown.shutdown_requested
+                            ),
+                        )
 
                 if not messages:
                     pause(stop)
         except Exception:
             log.exception("failed to fetch sqs message")
+            if failed is not None:
+                failed.set()
             raise
 
     return run
@@ -490,7 +527,7 @@ def _handle_message(
         ),
         what=f"deleting {message.id}",
         limit=config.endpoint_outage_limit,
-        interrupted=lambda seconds: _pause_unless_shutdown(shutdown, seconds),
+        interrupted=lambda seconds: _pause_and_heartbeat(shutdown, health, seconds),
     )
     if deleted is None:
         log.warning(
@@ -542,6 +579,7 @@ def consume(
     )
     stop_fetching = threading.Event()
     drained = threading.Event()
+    fetch_failed = threading.Event()
     sqs_fetch_thread = threading.Thread(
         target=fetch_sqs_thread(
             sqs,
@@ -551,6 +589,7 @@ def consume(
             config=config,
             queue=queue_to_process,
             queue_url=queue_url,
+            failed=fetch_failed,
         ),
         name="sqs_fetch",
         daemon=True,
@@ -567,15 +606,11 @@ def consume(
         },
     )
     total_messages_processed = 0
-    fetch_died = False
 
     try:
         while not shutdown.shutdown_requested:
-            # The fetch loop only returns once shutdown is requested, which the loop
-            # condition has seen first, so a dead thread here is one that raised.
-            if not sqs_fetch_thread.is_alive() and not shutdown.shutdown_requested:
+            if not sqs_fetch_thread.is_alive():
                 log.error("sqs_fetch_thread is dead shutting down")
-                fetch_died = True
                 break
 
             health.heartbeat()
@@ -617,7 +652,15 @@ def consume(
                     f"releasing the messages buffered behind {m.id} to preserve the FIFO order",
                     extra={"message_id": m.id},
                 )
-                requeue(sqs, _drain(queue_to_process), queue_url)
+                behind = list(_drain(queue_to_process))
+                through_outage(
+                    lambda: requeue(sqs, behind, queue_url),
+                    what=f"releasing the messages buffered behind {m.id}",
+                    limit=config.endpoint_outage_limit,
+                    interrupted=lambda seconds: _pause_and_heartbeat(
+                        shutdown, health, seconds
+                    ),
+                )
 
             health.heartbeat()
     finally:
@@ -632,14 +675,20 @@ def consume(
         if sqs_fetch_thread.is_alive():
             log.error("sqs thread still alive after join")
 
-        requeue(sqs, _drain(queue_to_process), queue_url)
+        try:
+            requeue(sqs, _drain(queue_to_process), queue_url)
+        except UNREACHABLE_ERRORS:
+            # Releasing only spares the buffered messages their visibility timeout; they
+            # return either way. Logged, and the clean-up and the exit's own error go on.
+            log.exception("could not release the buffered messages on shutdown")
         invoker.close()
         health_server.shutdown()
         health_server.server_close()
         if owns_client:
             sqs.close()
 
-    if fetch_died:
+    # Set by the fetch thread itself, so a failure that races a shutdown still surfaces.
+    if fetch_failed.is_set():
         raise RuntimeError(
             "the sqs fetch thread died, its traceback is logged above as 'failed to fetch sqs message'"
         )

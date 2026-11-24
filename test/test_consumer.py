@@ -14,7 +14,7 @@ import boto3
 import freezegun
 import pytest
 import urllib3
-from botocore.exceptions import ClientError, EndpointConnectionError
+from botocore.exceptions import ClientError, EndpointConnectionError, SSLError
 from moto import mock_aws
 from mypy_boto3_sqs import SQSClient
 from pydantic import ValidationError
@@ -1258,6 +1258,18 @@ def test_shutdown_during_an_outage_at_start_up_consumes_nothing(health: Health):
     sqs.receive_message.assert_not_called()
 
 
+def queue_depth(sqs: "SQSClient", queue_url: str) -> dict[str, str]:
+    """Visible and in-flight messages: a message that was never deleted counts in one."""
+    attributes = sqs.get_queue_attributes(
+        QueueUrl=queue_url,
+        AttributeNames=[
+            "ApproximateNumberOfMessages",
+            "ApproximateNumberOfMessagesNotVisible",
+        ],
+    )["Attributes"]
+    return {str(name): value for name, value in attributes.items()}
+
+
 def test_a_handled_message_is_deleted_once_the_endpoint_is_back(
     sqs: "SQSClient",
     health: Health,
@@ -1274,7 +1286,95 @@ def test_a_handled_message_is_deleted_once_the_endpoint_is_back(
     ):
         assert deletes.wait_for(2)
 
-    assert receive(sqs, sqs_queue_url, VisibilityTimeout=0) == []
+    # The consumer thread has been joined, so the second delete has returned.
+    assert queue_depth(sqs, sqs_queue_url) == {
+        "ApproximateNumberOfMessages": "0",
+        "ApproximateNumberOfMessagesNotVisible": "0",
+    }
+
+
+def test_the_heartbeat_stays_fresh_while_a_delete_waits_out_an_outage(
+    sqs: "SQSClient",
+    sqs_queue_url: str,
+    queue_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The main loop owns the heartbeat and a delete retry blocks it: without beats in the
+    pause, the liveness probe would kill a consumer that is only waiting."""
+    events = Recorder()
+    health = Health()
+    beat = health.heartbeat
+
+    def record_beat() -> None:
+        events.add("beat")
+        beat()
+
+    monkeypatch.setattr(health, "heartbeat", record_beat)
+    original_delete = sqs.delete_message
+    attempts = Recorder()
+
+    def flaky_delete(**kwargs: Any) -> Any:
+        attempts.add(kwargs)
+        events.add("delete")
+        if len(attempts) == 1:
+            raise unreachable()
+        return original_delete(**kwargs)
+
+    monkeypatch.setattr(sqs, "delete_message", flaky_delete)
+    config = worker_config(queue_name, create_queues=False)
+    send(sqs, sqs_queue_url, "hello")
+
+    with running_consumer(
+        handler=lambda m: None, config=config, health=health, sqs=sqs
+    ):
+        assert attempts.wait_for(2)
+
+    first, second = [i for i, e in enumerate(events.items) if e == "delete"][:2]
+    assert "beat" in events.items[first:second]
+
+
+def test_a_tls_error_is_not_retried_as_an_outage():
+    """A bad certificate is a setting to fix; five minutes of retries would only hide it."""
+    sqs = Mock(spec=SQSClient)
+    sqs.receive_message.side_effect = SSLError(
+        endpoint_url="https://sqs.example.com/", error=Exception("bad certificate")
+    )
+    config = Config(queue_url="https://example.com/q", wait_time_seconds=0)
+
+    with pytest.raises(SSLError):
+        run_fetch_loop(sqs, config, backoffs=1)
+
+    assert sqs.receive_message.call_count == 1
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_fetch_thread_that_dies_as_shutdown_begins_still_fails_the_consumer(
+    health: Health,
+):
+    """The loop can see the shutdown flag before it sees the dead thread; that race must
+    not turn the failure into a clean exit."""
+    config = Config(
+        queue_url="https://sqs.us-east-1.amazonaws.com/123456789012/foo",
+        wait_time_seconds=0,
+        health_check_port=get_free_port(),
+    )
+    shutdown = GracefulShutdown()
+    sqs = Mock(spec=SQSClient)
+
+    def fail_as_shutdown_begins(**_: Any) -> Any:
+        shutdown.shutdown()
+        raise RuntimeError("the broker refused")
+
+    sqs.receive_message.side_effect = fail_as_shutdown_begins
+
+    with pytest.raises(RuntimeError, match="fetch thread died"):
+        consume(
+            handler=lambda m: None,
+            config=config,
+            health=health,
+            shutdown=shutdown,
+            sqs=sqs,
+        )
 
 
 def test_consume_with_pre_provisioned_queue_url(
