@@ -78,6 +78,7 @@ export SQS_ENDPOINT_URL="http://localhost:4566"  # For elasticmq
 export SQS_MAX_MESSAGES=10                       # Messages per poll (1-10)
 export SQS_WAIT_TIME_SECONDS=20                  # Long polling wait time (0-20)
 export SQS_VISIBILITY_TIMEOUT=300                # Message visibility timeout (seconds)
+export SQS_ENDPOINT_OUTAGE_LIMIT=300             # Seconds to retry an unreachable endpoint before crashing (0: crash at once)
 
 # Handler Settings
 export SQS_ON_ERROR=crash                        # crash | continue on a handler exception
@@ -397,6 +398,8 @@ def handler(message: Message):
 - **Max Retries**: After `max_retries_until_dlq` attempts, messages are moved to the dead letter queue
 - **Timeouts**: A handler that hits `max_processing_time` is cancelled and its message is redelivered
 - **Graceful Shutdown**: On shutdown, any unprocessed messages are returned to the queue
+- **Unreachable Endpoint**: When the SQS endpoint cannot be reached (connection refused or closed, DNS failure, timeouts) at start-up, while receiving or while deleting a handled message, the consumer retries with a doubling pause (1s up to 15s), logging every failed attempt with its traceback. An outage longer than `endpoint_outage_limit` (default 300s) re-raises the last error and the consumer crashes. Any other error, such as access denied or a missing queue, is not retried
+- **Fetch Failures**: If the fetch thread dies, `consume` raises a `RuntimeError` instead of returning, so the process exits non-zero
 
 ## Queue Management
 

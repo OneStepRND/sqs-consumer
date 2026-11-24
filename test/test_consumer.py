@@ -14,7 +14,7 @@ import boto3
 import freezegun
 import pytest
 import urllib3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 from moto import mock_aws
 from mypy_boto3_sqs import SQSClient
 from pydantic import ValidationError
@@ -111,6 +111,28 @@ def spy_on_delivered_messages(
     return delivered
 
 
+def unreachable() -> EndpointConnectionError:
+    return EndpointConnectionError(endpoint_url="http://elasticmq:9324/")
+
+
+def unreachable_at_first(
+    monkeypatch: pytest.MonkeyPatch, sqs: "SQSClient", method: str, *, failures: int
+) -> Recorder:
+    """Makes `method` fail as an unreachable endpoint `failures` times, then delegates.
+    Records every attempt."""
+    attempts = Recorder()
+    original: Callable[..., Any] = getattr(sqs, method)
+
+    def flaky(**kwargs: Any) -> Any:
+        attempts.add(kwargs)
+        if len(attempts) <= failures:
+            raise unreachable()
+        return original(**kwargs)
+
+    monkeypatch.setattr(sqs, method, flaky)
+    return attempts
+
+
 def entries_of(calls: Recorder) -> list[dict[str, Any]]:
     return [entry for call in calls.items for entry in call["Entries"]]
 
@@ -152,6 +174,15 @@ def fast_supervisor_tick(monkeypatch: pytest.MonkeyPatch):
     """The supervisor polls its deadlines on a wall-clock tick, which only needs to be
     coarse enough in production. Nothing in the suite waits out the default."""
     monkeypatch.setattr(consumer_module, "SUPERVISOR_TICK", 0.01)
+
+
+@pytest.fixture(autouse=True)
+def fast_outage_retries(monkeypatch: pytest.MonkeyPatch):
+    """The pauses between retries of an unreachable endpoint are seconds long in production;
+    the outage tests bound an outage by endpoint_outage_limit, not by these pauses."""
+    monkeypatch.setattr(consumer_module, "OUTAGE_RETRY_FIRST", 0.001)
+    monkeypatch.setattr(consumer_module, "OUTAGE_RETRY_MAX", 0.01)
+    monkeypatch.setattr(consumer_module, "SHUTDOWN_POLL", 0.01)
 
 
 @pytest.fixture()
@@ -1110,7 +1141,111 @@ def test_a_dead_fetch_thread_shuts_down_the_consumer(health: Health):
     )
     sqs = Mock(spec=SQSClient)
     sqs.receive_message.side_effect = RuntimeError("sqs is unreachable")
+
+    with pytest.raises(RuntimeError, match="fetch thread died"):
+        consume(
+            handler=lambda m: None,
+            config=config,
+            health=health,
+            shutdown=GracefulShutdown(),
+            sqs=sqs,
+        )
+
+
+def test_fetch_rides_out_an_unreachable_endpoint():
+    """A broker that restarts or moves comes back; the consumer must still be there."""
+    sqs = Mock(spec=SQSClient)
+    raw = {"Body": "hello", "MessageId": "id-0", "ReceiptHandle": "receipt-0"}
+    sqs.receive_message.side_effect = [
+        unreachable(),
+        unreachable(),
+        {"Messages": [raw]},
+        {},
+    ]
+    config = Config(queue_url="https://example.com/q", wait_time_seconds=0)
+
+    run = run_fetch_loop(sqs, config, backoffs=1)
+
+    assert [run.buffer.get_nowait().body] == ["hello"]
+    assert sqs.receive_message.call_count == 4
+
+
+def test_fetch_gives_up_once_the_outage_outlasts_the_limit():
+    sqs = Mock(spec=SQSClient)
+    sqs.receive_message.side_effect = unreachable()
+    config = Config(
+        queue_url="https://example.com/q",
+        wait_time_seconds=0,
+        endpoint_outage_limit=0.05,
+    )
+
+    with pytest.raises(EndpointConnectionError):
+        run_fetch_loop(sqs, config, backoffs=1)
+
+    assert sqs.receive_message.call_count > 1
+
+
+def test_fetch_does_not_retry_an_error_that_is_not_an_outage():
+    """A refused request is a setting to fix, not a broker on its way back."""
+    sqs = Mock(spec=SQSClient)
+    sqs.receive_message.side_effect = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "ReceiveMessage"
+    )
+    config = Config(queue_url="https://example.com/q", wait_time_seconds=0)
+
+    with pytest.raises(ClientError):
+        run_fetch_loop(sqs, config, backoffs=1)
+
+    assert sqs.receive_message.call_count == 1
+
+
+def test_consume_waits_for_an_endpoint_unreachable_at_start_up(
+    sqs: "SQSClient",
+    health: Health,
+    sqs_queue_url: str,
+    queue_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = worker_config(queue_name, create_queues=False)
+    attempts = unreachable_at_first(monkeypatch, sqs, "get_queue_url", failures=2)
+    send(sqs, sqs_queue_url, "hello")
+    processed = Recorder()
+
+    with running_consumer(
+        handler=lambda m: processed.add(m.body), config=config, health=health, sqs=sqs
+    ):
+        assert processed.wait_for(1)
+
+    assert processed.items == ["hello"]
+    assert len(attempts) == 3
+
+
+def test_consume_crashes_when_the_endpoint_stays_unreachable_at_start_up(
+    health: Health,
+):
+    sqs = Mock(spec=SQSClient)
+    sqs.get_queue_url.side_effect = unreachable()
+    config = worker_config("foo", create_queues=False, endpoint_outage_limit=0.05)
+
+    with pytest.raises(EndpointConnectionError):
+        consume(
+            handler=lambda m: None,
+            config=config,
+            health=health,
+            shutdown=GracefulShutdown(),
+            sqs=sqs,
+        )
+
+    assert sqs.get_queue_url.call_count > 1
+    sqs.receive_message.assert_not_called()
+
+
+def test_shutdown_during_an_outage_at_start_up_consumes_nothing(health: Health):
+    sqs = Mock(spec=SQSClient)
+    sqs.get_queue_url.side_effect = unreachable()
+    config = worker_config("foo", create_queues=False)
     shutdown = GracefulShutdown()
+    shutdown.shutdown()
 
     consume(
         handler=lambda m: None,
@@ -1120,7 +1255,26 @@ def test_a_dead_fetch_thread_shuts_down_the_consumer(health: Health):
         sqs=sqs,
     )
 
-    assert shutdown.shutdown_requested
+    sqs.receive_message.assert_not_called()
+
+
+def test_a_handled_message_is_deleted_once_the_endpoint_is_back(
+    sqs: "SQSClient",
+    health: Health,
+    sqs_queue_url: str,
+    queue_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = worker_config(queue_name, create_queues=False)
+    deletes = unreachable_at_first(monkeypatch, sqs, "delete_message", failures=1)
+    send(sqs, sqs_queue_url, "hello")
+
+    with running_consumer(
+        handler=lambda m: None, config=config, health=health, sqs=sqs
+    ):
+        assert deletes.wait_for(2)
+
+    assert receive(sqs, sqs_queue_url, VisibilityTimeout=0) == []
 
 
 def test_consume_with_pre_provisioned_queue_url(

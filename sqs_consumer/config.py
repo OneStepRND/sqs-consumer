@@ -79,6 +79,14 @@ class Config(BaseSettings):
         ge=1,
         description="Local buffer capacity, defaults to max_messages * 3",
     )
+    endpoint_outage_limit: float = Field(
+        default=int(timedelta(minutes=5).total_seconds()),
+        ge=0,
+        description=(
+            "Seconds the consumer keeps retrying an SQS endpoint it cannot reach, at start-up "
+            "and while consuming, before it crashes; 0 crashes on the first failure"
+        ),
+    )
     max_retries_until_dlq: int = Field(
         default=3,
         ge=1,

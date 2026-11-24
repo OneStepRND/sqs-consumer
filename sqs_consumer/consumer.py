@@ -12,6 +12,8 @@ from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, Callable, Literal, Protocol, TypeIs, cast
 
 import boto3
+from botocore.exceptions import ConnectionError as BotoConnectionError
+from botocore.exceptions import HTTPClientError
 
 from sqs_consumer.config import Config
 from sqs_consumer.health import Health, create_health_server
@@ -29,6 +31,77 @@ Handler = SyncHandler | AsyncHandler
 CancelReason = Literal["max_processing_time", "shutdown"]
 
 SUPERVISOR_TICK = 0.5
+
+UNREACHABLE_ERRORS = (BotoConnectionError, HTTPClientError)
+"""What botocore raises, once its own retries are spent, when it cannot reach the endpoint
+or loses the connection to it: a broker that is restarting or moving, not a wrong setting."""
+
+OUTAGE_RETRY_FIRST = 1.0
+OUTAGE_RETRY_MAX = 15.0
+"""The pause before the first retry of an unreachable endpoint, doubling up to the max."""
+
+SHUTDOWN_POLL = 0.5
+
+
+def _pause_unless_shutdown(shutdown: "GracefulShutdown", seconds: float) -> bool:
+    """Sleeps up to `seconds`, waking early on a shutdown request. The flag is set from a
+    signal handler, so it is polled rather than waited on through a lock."""
+
+    deadline = time.monotonic() + seconds
+    while not shutdown.shutdown_requested:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        time.sleep(min(left, SHUTDOWN_POLL))
+    return shutdown.shutdown_requested
+
+
+def through_outage[T](
+    call: Callable[[], T],
+    *,
+    what: str,
+    limit: float,
+    interrupted: Callable[[float], bool],
+) -> T | None:
+    """Runs `call`, retrying it while the SQS endpoint cannot be reached, for at most `limit`
+    seconds of one outage; past that the last error propagates. Every failed attempt is
+    logged with its traceback. Returns None when `interrupted` reports a stop during a pause."""
+
+    outage_start: float | None = None
+    delay = OUTAGE_RETRY_FIRST
+    while True:
+        try:
+            result = call()
+        except UNREACHABLE_ERRORS:
+            now = time.monotonic()
+            if outage_start is None:
+                outage_start = now
+            elapsed = now - outage_start
+            if elapsed >= limit:
+                log.error(
+                    f"{what} : the SQS endpoint stayed unreachable for {elapsed:.0f}s, past endpoint_outage_limit={limit:g}s",
+                    extra={"outage_seconds": elapsed},
+                )
+                raise
+
+            pause = min(delay, limit - elapsed)
+            log.warning(
+                f"{what} : the SQS endpoint is unreachable, retrying in {pause:.1f}s",
+                exc_info=True,
+                extra={"outage_seconds": elapsed},
+            )
+            if interrupted(pause):
+                return None
+            delay = min(delay * 2, OUTAGE_RETRY_MAX)
+            continue
+
+        if outage_start is not None:
+            elapsed = time.monotonic() - outage_start
+            log.info(
+                f"{what} : the SQS endpoint is reachable again after {elapsed:.0f}s",
+                extra={"outage_seconds": elapsed},
+            )
+        return result
 
 
 class GracefulShutdown:
@@ -101,16 +174,25 @@ def fetch_sqs_thread(
 
                 log.debug("fetching message from sqs")
 
-                response = sqs.receive_message(
-                    QueueUrl=queue_url,
-                    WaitTimeSeconds=config.wait_time_seconds,
-                    MaxNumberOfMessages=min(config.max_messages, free_capacity),
-                    VisibilityTimeout=config.visibility_timeout,
-                    MessageSystemAttributeNames=[
-                        "MessageGroupId",
-                        "ApproximateReceiveCount",
-                    ],
+                response = through_outage(
+                    lambda: sqs.receive_message(
+                        QueueUrl=queue_url,
+                        WaitTimeSeconds=config.wait_time_seconds,
+                        MaxNumberOfMessages=min(config.max_messages, free_capacity),
+                        VisibilityTimeout=config.visibility_timeout,
+                        MessageSystemAttributeNames=[
+                            "MessageGroupId",
+                            "ApproximateReceiveCount",
+                        ],
+                    ),
+                    what="receiving messages",
+                    limit=config.endpoint_outage_limit,
+                    interrupted=lambda seconds: (
+                        stop.wait(seconds) or shutdown.shutdown_requested
+                    ),
                 )
+                if response is None:
+                    continue
                 messages = response.get("Messages", [])
                 log.debug(f"got {len(messages)} from queue")
                 for m in messages:
@@ -401,10 +483,20 @@ def _handle_message(
         )
         return False
 
-    sqs.delete_message(
-        QueueUrl=queue_url,
-        ReceiptHandle=message.receipt,
+    deleted = through_outage(
+        lambda: sqs.delete_message(
+            QueueUrl=queue_url,
+            ReceiptHandle=message.receipt,
+        ),
+        what=f"deleting {message.id}",
+        limit=config.endpoint_outage_limit,
+        interrupted=lambda seconds: _pause_unless_shutdown(shutdown, seconds),
     )
+    if deleted is None:
+        log.warning(
+            f"shutdown requested before {message.id} could be deleted, it will be delivered again",
+            extra={"message_id": message.id},
+        )
     return True
 
 
@@ -430,7 +522,18 @@ def consume(
     queue_to_process = MessageBuffer(config.buffer_capacity)
     owns_client = sqs is None
     sqs = sqs or boto3.client("sqs", endpoint_url=config.endpoint_url)  # pyright: ignore[reportUnknownMemberType]
-    queue_url = resolve_queue_url(sqs, config)
+    queue_url = through_outage(
+        lambda: resolve_queue_url(sqs, config),
+        what="resolving the queue url",
+        limit=config.endpoint_outage_limit,
+        interrupted=lambda seconds: _pause_unless_shutdown(shutdown, seconds),
+    )
+    if queue_url is None:
+        log.info("shutdown requested while the SQS endpoint was unreachable")
+        if owns_client:
+            sqs.close()
+        return
+
     health_server = create_health_server(health, "0.0.0.0", config.health_check_port)
     server_thread = threading.Thread(
         target=health_server.serve_forever,
@@ -464,12 +567,15 @@ def consume(
         },
     )
     total_messages_processed = 0
+    fetch_died = False
 
     try:
         while not shutdown.shutdown_requested:
-            if not sqs_fetch_thread.is_alive():
+            # The fetch loop only returns once shutdown is requested, which the loop
+            # condition has seen first, so a dead thread here is one that raised.
+            if not sqs_fetch_thread.is_alive() and not shutdown.shutdown_requested:
                 log.error("sqs_fetch_thread is dead shutting down")
-                shutdown.shutdown()
+                fetch_died = True
                 break
 
             health.heartbeat()
@@ -532,3 +638,8 @@ def consume(
         health_server.server_close()
         if owns_client:
             sqs.close()
+
+    if fetch_died:
+        raise RuntimeError(
+            "the sqs fetch thread died, its traceback is logged above as 'failed to fetch sqs message'"
+        )
